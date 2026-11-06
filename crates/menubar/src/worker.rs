@@ -192,6 +192,13 @@ struct Job<'a> {
 }
 
 impl Job<'_> {
+    /// Point the app at `id` and restart it. The caller holds the user's consent for the restart.
+    fn switch_and_restart(&self, config: &Config, kind: SurfaceKind, id: &str) -> Result<()> {
+        let surface = consenting_surface(kind);
+        switch::activate(self.env, config, surface.as_ref(), id)?;
+        surface.restart(self.env)
+    }
+
     /// Do what a click asked for. `Ok(Some(text))` is a message for the user.
     fn handle(&mut self, action: Action) -> Result<Option<String>> {
         let paths = self.env.paths;
@@ -227,10 +234,15 @@ impl Job<'_> {
             Action::RelaunchApp(kind) => {
                 let config = Config::load(paths)?;
                 let id = bound_account(&config, kind)?;
-                let surface = consenting_surface(kind);
-                switch::activate(self.env, &config, surface.as_ref(), &id)?;
-                surface.restart(self.env)?;
+                self.switch_and_restart(&config, kind, &id)?;
                 Ok(Some(format!("{} is on {}.", surface_name(kind), label_of(&config, &id))))
+            }
+            Action::SwitchApp(kind, id) => {
+                let config = switch::bind(paths, kind, Binding::Account(id.clone()))?;
+                let label = label_of(&config, &id);
+                self.switch_and_restart(&config, kind, &id)
+                    .map_err(|e| Error::Invalid(format!("{} is bound to {label}, but switching failed: {e}", surface_name(kind))))?;
+                Ok(Some(format!("{} is on {label}.", surface_name(kind))))
             }
             Action::OpenClaude => {
                 let config = Config::load(paths)?;
@@ -336,6 +348,18 @@ mod tests {
             assert!(said.starts_with("Nothing changed:") && said.contains("no longer current"), "{said}");
             assert!(!job.consent.get(), "consent is given only during the click");
         });
+    }
+
+    #[test]
+    fn switching_a_desktop_app_to_an_account_of_the_wrong_provider_is_refused_before_anything_restarts() {
+        let h = home();
+        with_job(&h, |job| {
+            assert!(job.handle(Action::SwitchApp(SurfaceKind::ChatgptDesktop, "a".into())).is_err());
+            assert!(job.handle(Action::SwitchApp(SurfaceKind::ClaudeDesktop, "missing".into())).is_err());
+        });
+        let c = Config::load(&h.paths).unwrap();
+        assert_eq!(c.surfaces.chatgpt_desktop, Binding::Unmanaged);
+        assert_eq!(c.surfaces.claude_desktop, Binding::Unmanaged);
     }
 
     #[test]

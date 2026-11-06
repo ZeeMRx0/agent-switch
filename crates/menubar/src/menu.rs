@@ -15,6 +15,9 @@ use crate::login_item::LoginStatus;
 
 /// Longest account label shown in a menu row.
 const MAX_LABEL_CHARS: usize = 48;
+/// Longest notice line shown at the top of the menu.
+const MAX_NOTICE_CHARS: usize = 100;
+const RELAUNCH_SUFFIX: &str = " (relaunches app)";
 
 /// What a menu click asks for.
 #[derive(Debug, Clone, PartialEq)]
@@ -25,6 +28,9 @@ pub enum Action {
     SetCodexMode(CodexCliMode),
     /// Quit the app, switch it to its bound account and open it again.
     RelaunchApp(SurfaceKind),
+    /// Desktop surfaces: bind the account, then quit and reopen the app on it. Clicking the account is the
+    /// user's consent to the relaunch.
+    SwitchApp(SurfaceKind, String),
     /// Open Claude on the profile of its bound account.
     OpenClaude,
     Undo(SurfaceKind),
@@ -64,6 +70,14 @@ pub struct Ctx {
     pub login: LoginStatus,
     /// False once the watcher thread has ended.
     pub watcher_running: bool,
+    /// The result of the latest click, shown as a disabled line because notifications may be denied.
+    pub notice: Option<String>,
+}
+
+/// Whether the tray menu must be rebuilt. A click forces it: the native check item flips by itself when
+/// clicked, so only a rebuild puts its check mark back in line with the model.
+pub fn should_rebuild(new: &[Entry], shown: &[Entry], forced: bool) -> bool {
+    forced || new != shown
 }
 
 pub fn surface_name(kind: SurfaceKind) -> &'static str {
@@ -88,10 +102,14 @@ pub fn label_of(config: &Config, id: &str) -> String {
 }
 
 fn clean(text: &str) -> String {
+    clean_to(text, MAX_LABEL_CHARS)
+}
+
+fn clean_to(text: &str, max: usize) -> String {
     let flat: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
     let flat = flat.trim();
-    if flat.chars().count() > MAX_LABEL_CHARS {
-        let cut: String = flat.chars().take(MAX_LABEL_CHARS - 1).collect();
+    if flat.chars().count() > max {
+        let cut: String = flat.chars().take(max - 1).collect();
         format!("{cut}…")
     } else {
         flat.to_string()
@@ -137,7 +155,14 @@ fn surface_entry(config: &Config, state: &State, kind: SurfaceKind, now: u64) ->
         .filter(|a| a.provider == kind.provider())
         .map(|a| {
             let text = format!("{} · {}", account_label(a), usage_text(state.usage.get(&a.id), now));
-            Entry::choice(text, current.as_deref() == Some(a.id.as_str()), Action::Bind(kind, Binding::Account(a.id.clone())))
+            let active = current.as_deref() == Some(a.id.as_str());
+            if kind.is_desktop() {
+                // Clicking an account here quits and reopens the app, so the row says so.
+                let text = if active { text } else { format!("{text}{RELAUNCH_SUFFIX}") };
+                Entry::choice(text, active, Action::SwitchApp(kind, a.id.clone()))
+            } else {
+                Entry::choice(text, active, Action::Bind(kind, Binding::Account(a.id.clone())))
+            }
         })
         .collect();
     if entries.is_empty() {
@@ -218,6 +243,10 @@ fn footer(config: &Config, state: &State, ctx: &Ctx) -> Vec<Entry> {
 /// The whole menu.
 pub fn build(config: &Config, state: &State, ctx: &Ctx) -> Vec<Entry> {
     let mut out = Vec::new();
+    if let Some(notice) = &ctx.notice {
+        out.push(Entry::Label(format!("Last: {}", clean_to(notice, MAX_NOTICE_CHARS))));
+        out.push(Entry::Separator);
+    }
     if !ctx.watcher_running {
         out.push(Entry::Label("The watcher stopped; quit and open agent-switch again".into()));
         out.push(Entry::Separator);
@@ -376,7 +405,7 @@ mod tests {
     }
 
     fn ctx() -> Ctx {
-        Ctx { now: NOW, login: LoginStatus::Disabled, watcher_running: true }
+        Ctx { now: NOW, login: LoginStatus::Disabled, watcher_running: true, notice: None }
     }
 
     fn find_submenu<'a>(entries: &'a [Entry], prefix: &str) -> &'a Vec<Entry> {
@@ -410,6 +439,40 @@ mod tests {
         // The checked one is the active account and clicking it changes nothing.
         assert_eq!(cli[1], Entry::Item { text: "Team · 5h 9% · 7d 6%".into(), action: None, checked: Some(true), enabled: true });
         assert_eq!(cli.last().unwrap(), &Entry::choice("Unmanaged (do not touch)", false, Action::Bind(SurfaceKind::ClaudeCli, Binding::Unmanaged)));
+    }
+
+    #[test]
+    fn a_desktop_account_row_says_it_relaunches_and_dispatches_the_combined_action() {
+        let c = config(); // Claude Desktop is bound to Team
+        let menu = build(&c, &State::default(), &ctx());
+        let desktop = find_submenu(&menu, "Claude Desktop");
+        assert_eq!(
+            desktop[0],
+            Entry::choice("Personal · no reading yet (relaunches app)", false, Action::SwitchApp(SurfaceKind::ClaudeDesktop, "personal".into()))
+        );
+        // The active one has no suffix and no action.
+        assert_eq!(desktop[1], Entry::Item { text: "Team · no reading yet".into(), action: None, checked: Some(true), enabled: true });
+        // Unmanaged only unbinds, and CLI rows are unchanged.
+        assert_eq!(desktop.last().unwrap(), &Entry::choice("Unmanaged (do not touch)", false, Action::Bind(SurfaceKind::ClaudeDesktop, Binding::Unmanaged)));
+        let cli = find_submenu(&menu, "Claude CLI");
+        assert!(matches!(&cli[1], Entry::Item { text, action: Some(Action::Bind(SurfaceKind::ClaudeCli, _)), .. } if !text.contains("relaunches")), "{cli:?}");
+    }
+
+    #[test]
+    fn the_latest_notice_is_a_disabled_line_at_the_top_and_gone_when_cleared() {
+        let c = config();
+        let with = build(&c, &State::default(), &Ctx { notice: Some("Claude Desktop now uses Team\nsecond line".into()), ..ctx() });
+        assert_eq!(with[0], Entry::Label("Last: Claude Desktop now uses Team second line".into()));
+        assert!(!to_text(&build(&c, &State::default(), &ctx())).contains("Last:"));
+    }
+
+    #[test]
+    fn a_click_forces_a_rebuild_even_when_the_model_is_unchanged() {
+        let c = config();
+        let a = build(&c, &State::default(), &ctx());
+        assert!(!should_rebuild(&a, &a, false), "a periodic refresh skips an unchanged menu");
+        assert!(should_rebuild(&a, &a, true), "a click rebuilds so the native check state matches");
+        assert!(should_rebuild(&a, &[], false));
     }
 
     #[test]
