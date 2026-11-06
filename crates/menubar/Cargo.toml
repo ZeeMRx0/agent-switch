@@ -1,0 +1,24 @@
+[package]
+name = "agent-switch-menubar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "agent-switch-menubar"
+path = "src/main.rs"
+
+[dependencies]
+agent-switch-core = { path = "../core" }
+block2 = "0.6.2"
+muda = "0.19.3"
+objc2 = "0.6.5"
+objc2-foundation = "0.3.2"
+objc2-service-management = "0.3.2"
+objc2-user-notifications = "0.3.2"
+tao = "0.36.0"
+tray-icon = "0.24.2"
+
+[dev-dependencies]
+tempfile.workspace = true
