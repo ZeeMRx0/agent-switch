@@ -6,6 +6,7 @@
 //! `UserEvent`s and `worker::Cmd`s only.
 
 mod icon;
+mod level_bar;
 mod login_item;
 mod menu;
 mod notify;

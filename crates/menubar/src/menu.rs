@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use agent_switch_core::config::{Account, Binding, CodexCliMode, Config, Provider, SurfaceKind};
 use agent_switch_core::policy;
 use agent_switch_core::state::{State, UsageRecord, UsageState, REASON_SWITCH_NEEDED};
-use muda::{CheckMenuItem, IsMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu};
+use muda::{CheckMenuItem, ContextMenu, IsMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 
 use crate::login_item::LoginStatus;
 
@@ -51,6 +51,77 @@ pub enum Entry {
     Label(String),
     Item { text: String, action: Option<Action>, checked: Option<bool>, enabled: bool },
     Submenu { text: String, entries: Vec<Entry> },
+    /// Level bars for the usage row just above. They are drawn as native bars, and `to_text` omits them
+    /// because that row already shows the same numbers.
+    Bars(Vec<Bar>),
+}
+
+/// How much of a usage window is left, as the color of its bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    /// Green.
+    Plenty,
+    /// Yellow.
+    Low,
+    /// Red: auto-switch moves surfaces away from the account at this point.
+    Critical,
+}
+
+/// One usage window as a level bar. `used` is the percent shown in the label; the bar shows what is left.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Bar {
+    /// `5h` or `7d`.
+    pub window: &'static str,
+    /// The used percent, 0-100, rounded like the menu text.
+    pub used: u8,
+    pub tier: Tier,
+}
+
+impl Bar {
+    /// The percent left, which is how full the bar is drawn.
+    pub fn remaining(&self) -> u8 {
+        100 - self.used
+    }
+}
+
+/// How many points above the red limit a bar turns yellow.
+const LOW_MARGIN: u8 = 20;
+
+/// The color of a bar with `remaining` percent left. Red when it is at or below what auto-switch leaves
+/// (`100 - threshold`, so 10% for the default threshold of 90); yellow up to `LOW_MARGIN` points above
+/// that; green otherwise.
+pub fn tier(remaining: u8, threshold: u8) -> Tier {
+    let critical = 100u8.saturating_sub(threshold);
+    if remaining <= critical {
+        Tier::Critical
+    } else if remaining <= critical.saturating_add(LOW_MARGIN) {
+        Tier::Low
+    } else {
+        Tier::Plenty
+    }
+}
+
+/// The bars of a reading: one per window it has. None when there is no reading or it is not a clean one
+/// (expired, dead, unreadable); the text row says why.
+pub fn usage_bars(rec: Option<&UsageRecord>, now: u64, threshold: u8) -> Vec<Bar> {
+    let Some(r) = rec.filter(|r| r.state == UsageState::Ok) else { return Vec::new() };
+    [("5h", &r.windows.five_hour), ("7d", &r.windows.weekly)]
+        .into_iter()
+        .filter_map(|(window, snap)| {
+            // `{:.0}` in `usage_text` rounds ties to even, so the label matches the text row.
+            let used = snap.as_ref()?.pct_at(now).round_ties_even().clamp(0.0, 100.0) as u8;
+            Some(Bar { window, used, tier: tier(100 - used, threshold) })
+        })
+        .collect()
+}
+
+/// `entry` followed by a bar row when `bars` is not empty.
+fn with_bars(entry: Entry, bars: Vec<Bar>) -> Vec<Entry> {
+    let mut out = vec![entry];
+    if !bars.is_empty() {
+        out.push(Entry::Bars(bars));
+    }
+    out
 }
 
 impl Entry {
@@ -164,7 +235,9 @@ fn provider_title(provider: Provider) -> &'static str {
     }
 }
 
-fn surface_entry(config: &Config, state: &State, kind: SurfaceKind, now: u64) -> Entry {
+/// The surface's submenu, followed by the bars of its current account.
+fn surface_entry(config: &Config, state: &State, kind: SurfaceKind, now: u64) -> Vec<Entry> {
+    let threshold = config.auto.threshold;
     let current = policy::current_account(config, state, kind);
     let title = match &current {
         Some(id) => format!("{}: {} · {}", surface_name(kind), label_of(config, id), usage_text(state.usage.get(id), now)),
@@ -174,16 +247,18 @@ fn surface_entry(config: &Config, state: &State, kind: SurfaceKind, now: u64) ->
         .accounts
         .iter()
         .filter(|a| a.provider == kind.provider())
-        .map(|a| {
-            let text = format!("{} · {}", account_label(a), usage_text(state.usage.get(&a.id), now));
+        .flat_map(|a| {
+            let rec = state.usage.get(&a.id);
+            let text = format!("{} · {}", account_label(a), usage_text(rec, now));
             let active = current.as_deref() == Some(a.id.as_str());
-            if kind.is_desktop() {
+            let row = if kind.is_desktop() {
                 // Clicking an account here quits and reopens the app, so the row says so.
                 let text = if active { text } else { format!("{text}{RELAUNCH_SUFFIX}") };
                 Entry::choice(text, active, Action::SwitchApp(kind, a.id.clone()))
             } else {
                 Entry::choice(text, active, Action::Bind(kind, Binding::Account(a.id.clone())))
-            }
+            };
+            with_bars(row, usage_bars(rec, now, threshold))
         })
         .collect();
     if entries.is_empty() {
@@ -191,7 +266,8 @@ fn surface_entry(config: &Config, state: &State, kind: SurfaceKind, now: u64) ->
     }
     entries.push(Entry::Separator);
     entries.push(Entry::choice("Unmanaged (do not touch)", current.is_none(), Action::Bind(kind, Binding::Unmanaged)));
-    Entry::Submenu { text: title, entries }
+    let bars = current.as_deref().map_or_else(Vec::new, |id| usage_bars(state.usage.get(id), now, threshold));
+    with_bars(Entry::Submenu { text: title, entries }, bars)
 }
 
 /// The open question for `kind`, as a row that does what the notification button does.
@@ -280,7 +356,7 @@ pub fn build(config: &Config, state: &State, ctx: &Ctx) -> Vec<Entry> {
     for provider in [Provider::Claude, Provider::Openai] {
         out.push(Entry::Label(provider_title(provider).into()));
         for kind in SurfaceKind::ALL.into_iter().filter(|k| k.provider() == provider) {
-            out.push(surface_entry(config, state, kind, ctx.now));
+            out.extend(surface_entry(config, state, kind, ctx.now));
             out.extend(pending_entry(config, state, kind, ctx.now));
         }
         match provider {
@@ -336,6 +412,7 @@ pub fn to_text(entries: &[Entry]) -> String {
                     out.push_str(&format!("{pad}{text} >\n"));
                     walk(entries, depth + 1, out);
                 }
+                Entry::Bars(_) => {}
             }
         }
     }
@@ -362,6 +439,8 @@ pub fn render(entries: &[Entry]) -> muda::Result<Rendered> {
     for item in items(entries, &mut actions, &mut counter)? {
         menu.append(item.as_ref())?;
     }
+    // Each `Entry` became exactly one native item, so the bar rows can be found by position.
+    crate::level_bar::attach(menu.ns_menu(), entries);
     Ok(Rendered { menu, actions })
 }
 
@@ -392,6 +471,11 @@ fn items(entries: &[Entry], actions: &mut HashMap<MenuId, Action>, counter: &mut
                     sub.append(child.as_ref())?;
                 }
                 out.push(Box::new(sub));
+            }
+            // A text stand-in that `level_bar::attach` turns into bars; it stays as text if that fails.
+            Entry::Bars(bars) => {
+                let text = bars.iter().map(|b| format!("{} {}%", b.window, b.used)).collect::<Vec<_>>().join(" · ");
+                out.push(Box::new(MenuItem::with_id(next_id(counter), text, false, None)));
             }
         }
     }
@@ -503,9 +587,84 @@ mod tests {
             cli[0],
             Entry::choice("Personal · 5h 32% · 7d 40%", false, Action::Bind(SurfaceKind::ClaudeCli, Binding::parse("personal")))
         );
+        // Each account with a reading is followed by its bars.
+        let plenty = |window, used| Bar { window, used, tier: Tier::Plenty };
+        assert_eq!(cli[1], Entry::Bars(vec![plenty("5h", 32), plenty("7d", 40)]));
         // The checked one is the active account and clicking it changes nothing.
-        assert_eq!(cli[1], Entry::Item { text: "Team · 5h 9% · 7d 6%".into(), action: None, checked: Some(true), enabled: true });
+        assert_eq!(cli[2], Entry::Item { text: "Team · 5h 9% · 7d 6%".into(), action: None, checked: Some(true), enabled: true });
+        assert_eq!(cli[3], Entry::Bars(vec![plenty("5h", 9), plenty("7d", 6)]));
         assert_eq!(cli.last().unwrap(), &Entry::choice("Unmanaged (do not touch)", false, Action::Bind(SurfaceKind::ClaudeCli, Binding::Unmanaged)));
+    }
+
+    #[test]
+    fn a_bar_turns_yellow_then_red_as_the_window_runs_out_following_the_auto_threshold() {
+        // Default threshold 90: red at 10% left or less, yellow up to 30% left.
+        assert_eq!(tier(100, 90), Tier::Plenty);
+        assert_eq!(tier(31, 90), Tier::Plenty);
+        assert_eq!(tier(30, 90), Tier::Low);
+        assert_eq!(tier(11, 90), Tier::Low);
+        assert_eq!(tier(10, 90), Tier::Critical);
+        assert_eq!(tier(0, 90), Tier::Critical);
+        // A lower threshold moves both limits up; the extremes never overflow.
+        assert_eq!(tier(40, 60), Tier::Critical);
+        assert_eq!(tier(41, 60), Tier::Low);
+        assert_eq!(tier(61, 60), Tier::Plenty);
+        assert_eq!(tier(0, 100), Tier::Critical);
+        assert_eq!(tier(1, 100), Tier::Low);
+        assert_eq!(tier(99, 1), Tier::Critical);
+        assert_eq!(tier(100, 1), Tier::Low);
+    }
+
+    #[test]
+    fn bars_come_only_from_a_clean_reading_and_follow_its_windows() {
+        let r = reading(72.0, 95.4);
+        assert_eq!(
+            usage_bars(Some(&r), NOW, 90),
+            vec![Bar { window: "5h", used: 72, tier: Tier::Low }, Bar { window: "7d", used: 95, tier: Tier::Critical }]
+        );
+        assert_eq!(usage_bars(Some(&r), NOW, 90)[1].remaining(), 5);
+        // A reset window is empty again.
+        assert_eq!(usage_bars(Some(&r), NOW + 4000, 90)[0], Bar { window: "5h", used: 0, tier: Tier::Plenty });
+        // The label rounds like the text row.
+        assert_eq!(usage_bars(Some(&reading(32.5, 0.0)), NOW, 90)[0].used, 32);
+        assert_eq!(usage_text(Some(&reading(32.5, 0.0)), NOW), "5h 32% · 7d 0%");
+        // Only the windows that were read.
+        let mut one = reading(10.0, 20.0);
+        one.windows.five_hour = None;
+        assert_eq!(usage_bars(Some(&one), NOW, 90), vec![Bar { window: "7d", used: 20, tier: Tier::Plenty }]);
+        // No reading, or one that is not clean: no bars.
+        assert!(usage_bars(None, NOW, 90).is_empty());
+        for bad in [UsageState::Expired, UsageState::Dead, UsageState::Unreadable] {
+            assert!(usage_bars(Some(&UsageRecord { state: bad, ..reading(10.0, 20.0) }), NOW, 90).is_empty(), "{bad:?}");
+        }
+        assert!(usage_bars(Some(&UsageRecord::default()), NOW, 90).is_empty());
+    }
+
+    #[test]
+    fn the_surface_row_is_followed_by_its_accounts_bars_which_stay_out_of_the_text_and_trigger_a_rebuild() {
+        let mut c = config();
+        c.auto.threshold = 80;
+        let mut s = State::default();
+        s.usage.insert("personal".into(), reading(85.0, 10.0));
+        s.usage.insert("team".into(), UsageRecord { state: UsageState::Dead, ..reading(9.0, 6.0) });
+        let menu = build(&c, &s, &ctx());
+        let at = |prefix: &str| menu.iter().position(|e| matches!(e, Entry::Submenu { text, .. } if text.starts_with(prefix))).unwrap();
+        // Claude CLI is on Personal: its bars follow, colored by the configured threshold.
+        assert_eq!(
+            menu[at("Claude CLI") + 1],
+            Entry::Bars(vec![Bar { window: "5h", used: 85, tier: Tier::Critical }, Bar { window: "7d", used: 10, tier: Tier::Plenty }])
+        );
+        // Claude Desktop is on Team, whose reading is dead; Codex CLI is unmanaged.
+        assert!(!matches!(menu[at("Claude Desktop") + 1], Entry::Bars(_)));
+        assert!(!matches!(menu[at("Codex CLI") + 1], Entry::Bars(_)));
+        let desktop = find_submenu(&menu, "Claude Desktop");
+        assert!(matches!(desktop[1], Entry::Bars(_)) && !matches!(desktop[3], Entry::Bars(_)), "{desktop:?}");
+
+        assert!(!to_text(&menu).contains("Bars"), "the bars add no text");
+        assert_eq!(to_text(&menu).lines().count(), to_text(&menu.iter().filter(|e| !matches!(e, Entry::Bars(_))).cloned().collect::<Vec<_>>()).lines().count());
+
+        s.usage.insert("personal".into(), reading(86.0, 10.0));
+        assert!(should_rebuild(&build(&c, &s, &ctx()), &menu, false), "a new reading redraws the bars");
     }
 
     #[test]

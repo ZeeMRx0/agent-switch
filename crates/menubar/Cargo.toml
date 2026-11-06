@@ -14,6 +14,7 @@ agent-switch-core = { path = "../core" }
 block2 = "0.6.2"
 muda = "0.19.3"
 objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSColor", "NSControl", "NSFont", "NSLevelIndicator", "NSLevelIndicatorCell", "NSMenu", "NSMenuItem", "NSResponder", "NSTextField", "NSView", "objc2-core-foundation"] }
 objc2-foundation = "0.3.2"
 objc2-service-management = "0.3.2"
 objc2-user-notifications = "0.3.2"
