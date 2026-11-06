@@ -88,6 +88,16 @@ agent-switch remove <account>                     # refused while the account is
 
 Desktop switches never quit an app without `--restart` (or a click on the menu bar notification).
 
+### Claude Desktop sessions follow you
+
+Desktop keeps the Code-tab session list per profile, so a new account used to open on an empty list. On every Claude Desktop switch agent-switch now copies the session records (`claude-code-sessions/<account>/<org>/local_*.json`) between your profiles, so each account lists every session with the newest content. Transcripts are already shared in `~/.claude/projects`. A switch prints a line such as `sessions: 2 mirrored, 0 backed up`.
+
+- **Busy guard.** If a session is mid-reply or waiting for your input, the switch refuses before quitting anything and names the session. Add `--force` (CLI) or choose "Switch anyway" in the menu bar (offered for 10 minutes after the refusal) to quit now; that reply is lost. "Switch anyway" ends only the sessions it listed: if a different one is busy when you click, the switch refuses again. Quitting also waits for (and, with `--force`, signals) the Claude Code agents Claude started from its profile folders; a `claude` you started in a terminal is never touched. `--force` also ends the reply by signalling Claude to quit when its own dialog would ask.
+- **Changes in several accounts.** The copy with more turns wins and the other copy is saved under `~/Library/Application Support/agent-switch/backups/sessions/`. Deleting a session in one account moves the other copies to that folder; nothing is unlinked.
+- **Untested Desktop version.** Mirroring runs only for the Claude Desktop version listed in `docs/architecture.md`. On any other version the switch still happens, with a warning and mirroring off. `doctor` reports the same.
+- **Turn it off or on.** `agent-switch desktop-sessions off [--dry-run]` gives each profile back its own sessions (newest content in the profile each came from), moves the other copies to the backup folder and keeps mirroring off. `agent-switch desktop-sessions on` resumes it at the next switch. Both need Claude closed.
+- **Not covered.** Cowork sessions, claude.ai web chats and sessions that Desktop runs in its own managed worktrees (the worktree state is per profile and is not copied, so such a session lists everywhere but may not reopen its worktree).
+
 ### Auto mode
 
 Auto-switching runs inside the menu bar app (one watcher at a time). Configure it in `~/.config/agent-switch/config.toml`:

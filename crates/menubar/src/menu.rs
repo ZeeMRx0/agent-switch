@@ -31,6 +31,10 @@ pub enum Action {
     /// Desktop surfaces: bind the account, then quit and reopen the app on it. Clicking the account is the
     /// user's consent to the relaunch.
     SwitchApp(SurfaceKind, String),
+    /// Like `RelaunchApp` (or `SwitchApp` when `account` is set), but also ends work in progress (a Claude
+    /// Desktop session that is mid-reply). `titles` are the sessions the user saw offered; the worker
+    /// refuses again if a different one is busy by then.
+    ForceRelaunch { kind: SurfaceKind, account: Option<String>, titles: String },
     /// Open Claude on the profile of its bound account.
     OpenClaude,
     Undo(SurfaceKind),
@@ -64,6 +68,21 @@ impl Entry {
     }
 }
 
+/// How long a refused switch can still be forced from the menu.
+pub const FORCE_OFFER_SECS: u64 = 600;
+
+/// A Desktop switch that was refused because work is in progress; the menu offers to force it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForceOffer {
+    pub kind: SurfaceKind,
+    /// The account of the refused `SwitchApp` click; `None` for a relaunch of the bound account.
+    pub account: Option<String>,
+    /// The titles of the sessions that would end.
+    pub titles: String,
+    /// When the refusal happened (unix seconds).
+    pub since: u64,
+}
+
 /// What the menu needs besides the config and the state.
 pub struct Ctx {
     pub now: u64,
@@ -72,6 +91,8 @@ pub struct Ctx {
     pub watcher_running: bool,
     /// The result of the latest click, shown as a disabled line because notifications may be denied.
     pub notice: Option<String>,
+    /// A refused busy switch that the user may force; ignored once it is older than `FORCE_OFFER_SECS`.
+    pub force_offer: Option<ForceOffer>,
 }
 
 /// Whether the tray menu must be rebuilt. A click forces it: the native check item flips by itself when
@@ -243,6 +264,11 @@ fn footer(config: &Config, state: &State, ctx: &Ctx) -> Vec<Entry> {
 /// The whole menu.
 pub fn build(config: &Config, state: &State, ctx: &Ctx) -> Vec<Entry> {
     let mut out = Vec::new();
+    if let Some(offer) = ctx.force_offer.as_ref().filter(|o| ctx.now.saturating_sub(o.since) < FORCE_OFFER_SECS) {
+        let titles = clean_to(&offer.titles, MAX_NOTICE_CHARS - 30);
+        out.push(Entry::item(format!("Switch anyway (ends: {titles})"), Action::ForceRelaunch { kind: offer.kind, account: offer.account.clone(), titles: offer.titles.clone() }));
+        out.push(Entry::Separator);
+    }
     if let Some(notice) = &ctx.notice {
         out.push(Entry::Label(format!("Last: {}", clean_to(notice, MAX_NOTICE_CHARS))));
         out.push(Entry::Separator);
@@ -405,7 +431,7 @@ mod tests {
     }
 
     fn ctx() -> Ctx {
-        Ctx { now: NOW, login: LoginStatus::Disabled, watcher_running: true, notice: None }
+        Ctx { now: NOW, login: LoginStatus::Disabled, watcher_running: true, notice: None, force_offer: None }
     }
 
     fn find_submenu<'a>(entries: &'a [Entry], prefix: &str) -> &'a Vec<Entry> {
@@ -416,6 +442,47 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_else(|| panic!("no submenu `{prefix}` in\n{}", to_text(entries)))
+    }
+
+    #[test]
+    fn busy_refusal_offers_switch_anyway() {
+        let c = config();
+        let offer = ForceOffer { kind: SurfaceKind::ClaudeDesktop, account: None, titles: "Fix login, Refactor".into(), since: NOW };
+        let menu = build(&c, &State::default(), &Ctx { force_offer: Some(offer.clone()), notice: Some("refused".into()), ..ctx() });
+        assert_eq!(menu[0], Entry::item(
+                "Switch anyway (ends: Fix login, Refactor)",
+                Action::ForceRelaunch { kind: SurfaceKind::ClaudeDesktop, account: None, titles: "Fix login, Refactor".into() }
+            ), "top item");
+        assert_eq!(menu[1], Entry::Separator);
+        assert_eq!(menu[2], Entry::Label("Last: refused".into()));
+        // The offer lapses after ten minutes and is absent when there was no refusal.
+        let late = build(&c, &State::default(), &Ctx { now: NOW + FORCE_OFFER_SECS, force_offer: Some(offer), ..ctx() });
+        assert!(!to_text(&late).contains("Switch anyway"));
+        assert!(!to_text(&build(&c, &State::default(), &ctx())).contains("Switch anyway"));
+    }
+
+    #[test]
+    fn a_quit_veto_refusal_produces_the_switch_anyway_offer() {
+        // The text `ClaudeDesktop::apply` returns when Claude's own dialog vetoed the quit.
+        let text = agent_switch_core::error::Error::Invalid(format!(
+            "{}a session Claude reports as working. Nothing was quit. Claude is asking whether to interrupt its work.",
+            agent_switch_core::adapters::claude_desktop::session_mirror::BUSY_PREFIX
+        ))
+        .to_string();
+        let titles = agent_switch_core::adapters::claude_desktop::session_mirror::busy_titles_in(&text).expect("the veto refusal parses as busy");
+        let offer = ForceOffer { kind: SurfaceKind::ClaudeDesktop, account: None, titles, since: NOW };
+        let menu = build(&config(), &State::default(), &Ctx { force_offer: Some(offer), ..ctx() });
+        assert_eq!(
+            menu[0],
+            Entry::item(
+                "Switch anyway (ends: a session Claude reports as working)",
+                Action::ForceRelaunch {
+                    kind: SurfaceKind::ClaudeDesktop,
+                    account: None,
+                    titles: "a session Claude reports as working".into()
+                }
+            )
+        );
     }
 
     #[test]

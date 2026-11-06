@@ -28,6 +28,10 @@ pub enum Error {
     SymlinkedParent(PathBuf),
     #[error("{0} is a symlink (a dotfile manager such as stow or chezmoi may own it). agent-switch will not replace it with a regular file. Make it a regular file, or exclude it from the manager, then run the command again")]
     SymlinkedFile(PathBuf),
+    /// The app answered a quit request with its own "still working" dialog and the user (or the script)
+    /// cancelled it. `exited` lists the app processes that were already gone when the veto came.
+    #[error("{app} is asking whether to interrupt its work. Answer its dialog (Cancel keeps it working), then run the command again")]
+    QuitVetoed { app: &'static str, exited: Vec<u32> },
 }
 
 impl Error {

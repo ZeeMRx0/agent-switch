@@ -1,6 +1,5 @@
 //! Which `Surface` implementation serves each surface kind.
 
-use agent_switch_core::adapters::claude_desktop::ClaudeDesktop;
 use agent_switch_core::config::SurfaceKind;
 use agent_switch_core::surface::Surface;
 
@@ -8,11 +7,11 @@ pub fn surface_for(kind: SurfaceKind) -> Box<dyn Surface> {
     agent_switch_core::adapters::surface_for(kind)
 }
 
-/// The surface for `switch`. `--restart` on a Desktop app is consent to quit it.
+/// The surface for `switch`, except Claude Desktop, which `commands::switch` builds itself to read its mirror
+/// result. `--restart` on a Desktop app is consent to quit it.
 pub fn surface_for_switch(kind: SurfaceKind, restart: bool) -> Box<dyn Surface> {
     match kind {
         SurfaceKind::ChatgptDesktop if restart => Box::new(crate::codex_commands::chatgpt_with_quit()),
-        SurfaceKind::ClaudeDesktop if restart => Box::new(ClaudeDesktop::production().with_restart()),
         _ => surface_for(kind),
     }
 }

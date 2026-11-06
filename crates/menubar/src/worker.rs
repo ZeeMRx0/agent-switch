@@ -43,6 +43,8 @@ pub enum Report {
     Event(Event),
     /// Something the user should read: the result of a click, or why it did nothing.
     Notice { title: String, body: String },
+    /// A Desktop switch was refused because these sessions are mid-reply; the menu offers "Switch anyway".
+    Busy { kind: SurfaceKind, account: Option<String>, titles: String },
     /// Config or state may have changed.
     Changed,
     /// The thread ended; the text says why.
@@ -99,10 +101,20 @@ pub fn spawn(report: impl Fn(Report) + Send + Sync + 'static) -> std::result::Re
     }
 }
 
+/// Claude Desktop, allowed to quit because the user clicked. `force` holds the session titles the user
+/// agreed to end; a different busy session still refuses the switch.
+fn claude_desktop_surface(force: Option<&str>) -> ClaudeDesktop {
+    let desktop = ClaudeDesktop::production().with_restart();
+    match force {
+        Some(titles) => desktop.with_force_if_only(titles),
+        None => desktop,
+    }
+}
+
 /// An adapter that may quit and reopen its app, because the user clicked for it.
 fn consenting_surface(kind: SurfaceKind) -> Box<dyn Surface> {
     match kind {
-        SurfaceKind::ClaudeDesktop => Box::new(ClaudeDesktop::production().with_restart()),
+        SurfaceKind::ClaudeDesktop => Box::new(claude_desktop_surface(None)),
         // Other programs that use ~/.codex (an IDE extension, for example) are never stopped from here.
         SurfaceKind::ChatgptDesktop => Box::new(ChatgptDesktop::production().with_quit(Box::new(|_| false))),
         other => surface_for(other),
@@ -166,11 +178,18 @@ fn run(report: Arc<dyn Fn(Report) + Send + Sync>, rx: mpsc::Receiver<Cmd>, ready
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(Cmd::Do(action)) => {
                 let wakes_watcher = matches!(action, Action::SetAuto(true));
+                let forceable = forceable_kind(&action);
                 let outcome = catch_unwind(AssertUnwindSafe(|| job.handle(action)));
                 match outcome {
                     Ok(Ok(Some(body))) => report(Report::Notice { title: "agent-switch".into(), body }),
                     Ok(Ok(None)) => {}
-                    Ok(Err(e)) => report(Report::Notice { title: "agent-switch could not finish".into(), body: e.to_string() }),
+                    Ok(Err(e)) => {
+                        let text = e.to_string();
+                        if let (Some((kind, account)), Some(titles)) = (forceable, claude_desktop::session_mirror::busy_titles_in(&text)) {
+                            report(Report::Busy { kind, account, titles });
+                        }
+                        report(Report::Notice { title: "agent-switch could not finish".into(), body: text });
+                    }
                     Err(_) => break "an action panicked".to_string(),
                 }
                 if wakes_watcher {
@@ -185,6 +204,18 @@ fn run(report: Arc<dyn Fn(Report) + Send + Sync>, rx: mpsc::Receiver<Cmd>, ready
     report(Report::Exited(reason));
 }
 
+/// The surface (and, for an account click, the account) of a click whose busy refusal can be forced from
+/// the menu. A refused account click is rolled back to the previous binding, so the offer must name the
+/// account for "Switch anyway" to switch to it.
+fn forceable_kind(action: &Action) -> Option<(SurfaceKind, Option<String>)> {
+    match action {
+        Action::RelaunchApp(kind @ SurfaceKind::ClaudeDesktop) => Some((*kind, None)),
+        Action::SwitchApp(kind @ SurfaceKind::ClaudeDesktop, id) => Some((*kind, Some(id.clone()))),
+        Action::ForceRelaunch { kind: kind @ SurfaceKind::ClaudeDesktop, account, .. } => Some((*kind, account.clone())),
+        _ => None,
+    }
+}
+
 struct Job<'a> {
     env: &'a Env<'a>,
     consent: &'a Cell<bool>,
@@ -193,10 +224,61 @@ struct Job<'a> {
 
 impl Job<'_> {
     /// Point the app at `id` and restart it. The caller holds the user's consent for the restart.
-    fn switch_and_restart(&self, config: &Config, kind: SurfaceKind, id: &str) -> Result<()> {
+    /// `force` holds the session titles the user agreed to end (Claude Desktop). When `rollback` is set and
+    /// the switch is refused or fails before the app is touched, the binding goes back to it.
+    /// Returns what session mirroring did (Claude Desktop only), for the message to the user.
+    fn switch_and_restart(&self, config: &Config, kind: SurfaceKind, id: &str, force: Option<&str>, rollback: Option<&Binding>) -> Result<Option<String>> {
+        let env = self.env;
+        let activate = |surface: &dyn Surface| switch::activate(env, config, surface, id).map_err(|e| self.restore_binding(config, kind, id, rollback, e));
+        if kind == SurfaceKind::ClaudeDesktop {
+            let desktop = claude_desktop_surface(force);
+            activate(&desktop)?;
+            desktop.restart(env)?;
+            return Ok(desktop.mirror_summary().or_else(|| desktop.mirror_warning().map(|w| format!("warning: {w}"))));
+        }
         let surface = consenting_surface(kind);
-        switch::activate(self.env, config, surface.as_ref(), id)?;
-        surface.restart(self.env)
+        activate(surface.as_ref())?;
+        surface.restart(env)?;
+        Ok(None)
+    }
+
+    /// A failed switch must not leave the binding on an account the app never moved to. Returns the error
+    /// to show, which says what happened to the binding.
+    fn restore_binding(&self, config: &Config, kind: SurfaceKind, id: &str, rollback: Option<&Binding>, cause: Error) -> Error {
+        let Some(previous) = rollback else { return cause };
+        let label = label_of(config, id);
+        let reason = cause.to_string();
+        let reason = reason.trim_end_matches('.');
+        let outcome = match switch::bind(self.env.paths, kind, previous.clone()) {
+            Ok(restored) => {
+                let was = previous.account_id().map_or_else(|| "unmanaged".to_string(), |p| label_of(&restored, p));
+                format!("The binding was put back on {was}.")
+            }
+            Err(e) => format!("The binding stays on {label} because putting the previous one back failed: {e}."),
+        };
+        Error::Invalid(format!("Switching {} to {label} failed: {reason}. {outcome}", surface_name(kind)))
+    }
+
+    /// Bind `id` and switch the running app to it; a refusal restores the previous binding.
+    fn switch_to(&self, kind: SurfaceKind, id: &str, force: Option<&str>) -> Result<Option<String>> {
+        let paths = self.env.paths;
+        let previous = Config::load(paths)?.surfaces.get(kind).clone();
+        let config = switch::bind(paths, kind, Binding::Account(id.to_string()))?;
+        let label = label_of(&config, id);
+        let mirrored = self.switch_and_restart(&config, kind, id, force, Some(&previous)).map_err(|e| match e {
+            // The binding was already put back; the message says so.
+            Error::Invalid(text) if text.starts_with("Switching ") => Error::Invalid(text),
+            // The app was switched but did not come up signed in: the binding stays.
+            other => Error::Invalid(format!("{} is bound to {label}, but switching failed: {other}", surface_name(kind))),
+        })?;
+        Ok(Some(on_account(kind, &label, mirrored)))
+    }
+
+    fn relaunch_bound(&self, kind: SurfaceKind, force: Option<&str>) -> Result<Option<String>> {
+        let config = Config::load(self.env.paths)?;
+        let id = bound_account(&config, kind)?;
+        let mirrored = self.switch_and_restart(&config, kind, &id, force, None)?;
+        Ok(Some(on_account(kind, &label_of(&config, &id), mirrored)))
     }
 
     /// Do what a click asked for. `Ok(Some(text))` is a message for the user.
@@ -231,19 +313,10 @@ impl Job<'_> {
                 })?;
                 Ok(None)
             }
-            Action::RelaunchApp(kind) => {
-                let config = Config::load(paths)?;
-                let id = bound_account(&config, kind)?;
-                self.switch_and_restart(&config, kind, &id)?;
-                Ok(Some(format!("{} is on {}.", surface_name(kind), label_of(&config, &id))))
-            }
-            Action::SwitchApp(kind, id) => {
-                let config = switch::bind(paths, kind, Binding::Account(id.clone()))?;
-                let label = label_of(&config, &id);
-                self.switch_and_restart(&config, kind, &id)
-                    .map_err(|e| Error::Invalid(format!("{} is bound to {label}, but switching failed: {e}", surface_name(kind))))?;
-                Ok(Some(format!("{} is on {label}.", surface_name(kind))))
-            }
+            Action::RelaunchApp(kind) => self.relaunch_bound(kind, None),
+            Action::ForceRelaunch { kind, account: None, titles } => self.relaunch_bound(kind, Some(&titles)),
+            Action::ForceRelaunch { kind, account: Some(id), titles } => self.switch_to(kind, &id, Some(&titles)),
+            Action::SwitchApp(kind, id) => self.switch_to(kind, &id, None),
             Action::OpenClaude => {
                 let config = Config::load(paths)?;
                 let id = bound_account(&config, SurfaceKind::ClaudeDesktop)?;
@@ -268,6 +341,14 @@ impl Job<'_> {
             }
             Action::SetLoginItem(_) | Action::Quit => Ok(None), // handled on the UI thread
         }
+    }
+}
+
+/// "Claude Desktop is on Team." plus the session-mirroring result when there is one.
+fn on_account(kind: SurfaceKind, label: &str, mirrored: Option<String>) -> String {
+    match mirrored {
+        Some(m) => format!("{} is on {label}. {m}", surface_name(kind)),
+        None => format!("{} is on {label}.", surface_name(kind)),
     }
 }
 
@@ -369,5 +450,48 @@ mod tests {
             assert!(job.handle(Action::Bind(SurfaceKind::CodexCli, Binding::parse("a"))).is_err());
         });
         assert_eq!(Config::load(&h.paths).unwrap().surfaces.codex_cli, Binding::Unmanaged);
+    }
+
+    #[test]
+    fn force_relaunch_uses_forced_surface() {
+        assert!(claude_desktop_surface(Some("Fix login")).is_forced());
+        assert!(!claude_desktop_surface(None).is_forced(), "a plain relaunch never ends work in progress");
+        let h = home();
+        with_job(&h, |job| {
+            // It needs a bound account, like Relaunch, and only a busy refusal of Claude Desktop is forceable.
+            let force = Action::ForceRelaunch { kind: SurfaceKind::ClaudeDesktop, account: None, titles: "Fix login".into() };
+            assert!(job.handle(force).unwrap_err().to_string().contains("unmanaged"));
+        });
+        let desktop = SurfaceKind::ClaudeDesktop;
+        assert_eq!(forceable_kind(&Action::RelaunchApp(desktop)), Some((desktop, None)));
+        assert_eq!(forceable_kind(&Action::SwitchApp(desktop, "a".into())), Some((desktop, Some("a".into()))));
+        let again = Action::ForceRelaunch { kind: desktop, account: Some("a".into()), titles: "t".into() };
+        assert_eq!(forceable_kind(&again), Some((desktop, Some("a".into()))));
+        assert_eq!(forceable_kind(&Action::RelaunchApp(SurfaceKind::ChatgptDesktop)), None);
+        assert_eq!(forceable_kind(&Action::Relaunch { kind: desktop, event_id: "e".into() }), None);
+    }
+
+    #[test]
+    fn a_failed_account_click_puts_the_previous_binding_back() {
+        let h = home();
+        with_job(&h, |job| {
+            // No Desktop profile exists for `a` or `b`, so the switch fails before anything is quit.
+            job.handle(Action::Bind(SurfaceKind::ClaudeDesktop, Binding::parse("b"))).unwrap();
+            let err = job.handle(Action::SwitchApp(SurfaceKind::ClaudeDesktop, "a".into())).unwrap_err().to_string();
+            assert!(err.contains("Switching Claude Desktop to A failed") && err.contains("put back on B"), "{err}");
+            assert_eq!(Config::load(&h.paths).unwrap().surfaces.claude_desktop, Binding::parse("b"));
+        });
+        let h = home();
+        with_job(&h, |job| {
+            let err = job.handle(Action::SwitchApp(SurfaceKind::ClaudeDesktop, "a".into())).unwrap_err().to_string();
+            assert!(err.contains("put back on unmanaged"), "{err}");
+            assert_eq!(Config::load(&h.paths).unwrap().surfaces.claude_desktop, Binding::Unmanaged);
+        });
+    }
+
+    #[test]
+    fn a_session_summary_follows_the_switch_message() {
+        assert_eq!(on_account(SurfaceKind::ClaudeDesktop, "Team", Some("sessions: 2 mirrored, 0 backed up".into())), "Claude Desktop is on Team. sessions: 2 mirrored, 0 backed up");
+        assert_eq!(on_account(SurfaceKind::ChatgptDesktop, "Team", None), "ChatGPT is on Team.");
     }
 }

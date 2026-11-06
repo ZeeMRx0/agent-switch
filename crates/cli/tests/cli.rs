@@ -183,3 +183,15 @@ fn list_json_masks_emails_and_reports_an_account_without_a_saved_login_as_unread
     assert!(rows[0]["five_hour"].is_null() && rows[0]["weekly"].is_null());
     assert!(!String::from_utf8_lossy(&o.stdout).contains("zee@"));
 }
+
+#[test]
+fn switch_offers_force_and_desktop_sessions_rejects_an_unknown_action() {
+    let home = tempfile::tempdir().unwrap();
+    let o = run(home.path(), &["switch", "--help"]);
+    assert!(o.status.success() && text(&o).contains("--force"), "{}", text(&o));
+    let o = run(home.path(), &["desktop-sessions", "sideways"]);
+    assert!(!o.status.success());
+    assert!(text(&o).contains("use `on` or `off`"), "{}", text(&o));
+    let o = run(home.path(), &["desktop-sessions", "--help"]);
+    assert!(text(&o).contains("--dry-run"), "{}", text(&o));
+}

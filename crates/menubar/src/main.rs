@@ -24,7 +24,7 @@ use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
-use crate::menu::{Action, Ctx, Entry};
+use crate::menu::{Action, Ctx, Entry, ForceOffer};
 use crate::notify::{Note, Notifier};
 use crate::worker::{Handle, Report, StartError};
 
@@ -87,8 +87,8 @@ fn main() {
 }
 
 /// The menu for what is on disk now.
-fn current_menu(paths: &Paths, watcher_running: bool, notice: Option<&str>) -> Vec<Entry> {
-    let ctx = Ctx { now: now_secs(), login: login_item::status(), watcher_running, notice: notice.map(str::to_string) };
+fn current_menu(paths: &Paths, watcher_running: bool, notice: Option<&str>, force_offer: Option<ForceOffer>) -> Vec<Entry> {
+    let ctx = Ctx { now: now_secs(), login: login_item::status(), watcher_running, notice: notice.map(str::to_string), force_offer };
     match (Config::load(paths), State::load(paths)) {
         (Ok(config), Ok(state)) => menu::build(&config, &state, &ctx),
         (Err(e), _) | (_, Err(e)) => menu::error_menu(&e.to_string(), &ctx),
@@ -98,7 +98,7 @@ fn current_menu(paths: &Paths, watcher_running: bool, notice: Option<&str>) -> V
 fn print_menu() -> i32 {
     match Paths::from_env() {
         Ok(paths) => {
-            print!("{}", menu::to_text(&current_menu(&paths, true, None)));
+            print!("{}", menu::to_text(&current_menu(&paths, true, None, None)));
             0
         }
         Err(e) => {
@@ -153,7 +153,7 @@ fn run_app() -> i32 {
     }));
     spawn_ticker(proxy.clone());
 
-    let mut app = App { paths, proxy, worker: Some(worker), tray: None, notifier: None, actions: HashMap::new(), shown: Vec::new(), force_rebuild: false, last_notice: None, watcher_running: true, counter: 0 };
+    let mut app = App { paths, proxy, worker: Some(worker), tray: None, notifier: None, actions: HashMap::new(), shown: Vec::new(), force_rebuild: false, last_notice: None, force_offer: None, watcher_running: true, counter: 0 };
     event_loop.run(move |event, _, flow| {
         *flow = ControlFlow::Wait;
         match event {
@@ -164,6 +164,7 @@ fn run_app() -> i32 {
                 // an item that has no action.
                 app.force_rebuild = true;
                 app.last_notice = None;
+                app.force_offer = None; // any click, including "Switch anyway" itself, uses up the offer
                 match app.actions.get(&id).cloned() {
                     Some(action) => app.dispatch(action, flow),
                     None => app.refresh(),
@@ -204,6 +205,8 @@ struct App {
     force_rebuild: bool,
     /// The latest action result, kept in the menu because notifications may be denied.
     last_notice: Option<String>,
+    /// A refused busy switch the menu can force; the menu drops it after `menu::FORCE_OFFER_SECS`.
+    force_offer: Option<ForceOffer>,
     watcher_running: bool,
     counter: u64,
 }
@@ -226,7 +229,7 @@ impl App {
 
     /// Rebuild the menu when what it shows has changed, or when a click asked for it.
     fn refresh(&mut self) {
-        let entries = current_menu(&self.paths, self.watcher_running, self.last_notice.as_deref());
+        let entries = current_menu(&self.paths, self.watcher_running, self.last_notice.as_deref(), self.force_offer.clone());
         if !menu::should_rebuild(&entries, &self.shown, self.force_rebuild) {
             return;
         }
@@ -279,6 +282,10 @@ impl App {
                 Err(e) => log_line(&format!("cannot read the config for a notification: {e}")),
             },
             Report::Notice { title, body } => self.notice(&title, &body),
+            Report::Busy { kind, account, titles } => {
+                self.force_offer = Some(ForceOffer { kind, account, titles, since: now_secs() });
+                self.force_rebuild = true;
+            }
             Report::Changed => self.refresh(),
             Report::Exited(reason) => {
                 if reason != "stopped" {

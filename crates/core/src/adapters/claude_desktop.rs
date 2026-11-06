@@ -15,6 +15,7 @@
 //! `src/desktop.rs` (`lastKnownAccountUuid`, launch), `src/desktop_runtime.rs` (runtime clone).
 
 pub mod manage;
+pub mod session_mirror;
 #[cfg(test)]
 mod tests;
 
@@ -31,7 +32,7 @@ use crate::doctor::{Check, Level};
 use crate::error::{Error, Result};
 use crate::fsutil::{ensure_private_dir, safe_write, WriteOpts};
 use crate::locks::FlockGuard;
-use crate::macos_apps::{self, bundle_pids, instances, join_pids, quit_all_instances, Instance, QuitOpts, System, SystemApps, CLAUDE};
+use crate::macos_apps::{self, bundle_pids, instances, join_pids, quit_all_instances, quit_all_instances_with, Instance, ProcInfo, QuitOpts, System, SystemApps, CLAUDE};
 use crate::paths::Paths;
 use crate::proc;
 use crate::state::now_secs;
@@ -69,6 +70,34 @@ pub(crate) fn canon(path: &Path) -> PathBuf {
 
 pub(crate) fn same_dir(a: &Path, b: &Path) -> bool {
     canon(a) == canon(b)
+}
+
+/// Folders Claude Desktop may run from: the default profile and every registered one.
+pub fn known_profile_dirs(paths: &Paths) -> Vec<PathBuf> {
+    let mut dirs = vec![default_profile(paths)];
+    if let Ok(registry) = Registry::load(paths) {
+        dirs.extend(registry.profiles.values().map(|e| e.dir.clone()));
+    }
+    dirs
+}
+
+/// Claude Code agents that Desktop starts run from `<profile>/claude-code/<version>/<hash>/claude.app/Contents/MacOS/`,
+/// outside the app bundle. A `claude` started from a terminal runs from other paths and is not matched.
+pub fn claude_code_pids(procs: &[ProcInfo], profile_dirs: &[PathBuf]) -> Vec<u32> {
+    let mut prefixes: Vec<String> = Vec::new();
+    for dir in profile_dirs {
+        for root in [dir.clone(), canon(dir)] {
+            let prefix = format!("{}/claude-code/", root.display());
+            if !prefixes.contains(&prefix) {
+                prefixes.push(prefix);
+            }
+        }
+    }
+    procs
+        .iter()
+        .filter(|p| p.command.contains("/claude.app/Contents/MacOS/") && prefixes.iter().any(|prefix| p.command.starts_with(prefix)))
+        .map(|p| p.pid)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -308,6 +337,19 @@ pub struct ClaudeDesktop {
     settle: Duration,
     /// Set by `apply`: the account and profile folder `restart` opens.
     reopen: RefCell<Option<(String, PathBuf)>>,
+    /// `--force`: switch even when a session is mid-reply or waiting for a person.
+    force: bool,
+    /// With `force`: the session titles the user saw and agreed to end. A busy session outside this list
+    /// refuses the switch again.
+    force_only: Option<String>,
+    /// Set by `apply`: running profiles whose sessions the busy pre-check could not read.
+    precheck_notes: RefCell<Vec<String>>,
+    /// Replaces the installed app version when deciding whether session mirroring is safe (tests).
+    version_override: Option<String>,
+    /// Set by `apply`: the one-line result of mirroring the session records.
+    mirror_summary: RefCell<Option<String>>,
+    /// Set by `apply`: why mirroring did not run or fully run. The switch itself still went ahead.
+    mirror_warning: RefCell<Option<String>>,
 }
 
 impl ClaudeDesktop {
@@ -325,6 +367,12 @@ impl ClaudeDesktop {
             // Chromium flushes cookies on a timer; give a fresh launch a moment before judging the session.
             settle: Duration::from_secs(4),
             reopen: RefCell::new(None),
+            force: false,
+            force_only: None,
+            precheck_notes: RefCell::new(Vec::new()),
+            version_override: None,
+            mirror_summary: RefCell::new(None),
+            mirror_warning: RefCell::new(None),
         }
     }
 
@@ -332,6 +380,43 @@ impl ClaudeDesktop {
     pub fn with_restart(mut self) -> ClaudeDesktop {
         self.restart_requested = true;
         self
+    }
+
+    /// Switch even when a session is mid-reply or waiting for a person; that work is lost.
+    pub fn with_force(mut self) -> ClaudeDesktop {
+        self.force = true;
+        self
+    }
+
+    /// Like `with_force`, but only for the sessions in `offered` (the titles of an earlier refusal, as its
+    /// text lists them). If a different session is busy by the time of the switch, it is refused again.
+    pub fn with_force_if_only(mut self, offered: impl Into<String>) -> ClaudeDesktop {
+        self.force = true;
+        self.force_only = Some(offered.into());
+        self
+    }
+
+    /// Treat `version` as the installed Claude Desktop version when gating session mirroring.
+    pub fn with_desktop_version(mut self, version: impl Into<String>) -> ClaudeDesktop {
+        self.version_override = Some(version.into());
+        self
+    }
+
+    /// Whether `with_force` was applied.
+    pub fn is_forced(&self) -> bool {
+        self.force
+    }
+
+    /// After `apply`: "sessions: N mirrored, M backed up" when the session records were mirrored.
+    pub fn mirror_summary(&self) -> Option<String> {
+        self.mirror_summary.borrow().clone()
+    }
+
+    /// After `apply`: the reason mirroring was skipped or failed (the switch still succeeded).
+    pub fn mirror_warning(&self) -> Option<String> {
+        let mut parts = self.precheck_notes.borrow().clone();
+        parts.extend(self.mirror_warning.borrow().clone());
+        (!parts.is_empty()).then(|| parts.join("; "))
     }
 
     pub fn with_timing(mut self, quit: QuitOpts, reask: Duration, launch_timeout: Duration, settle: Duration) -> ClaudeDesktop {
@@ -348,6 +433,80 @@ impl ClaudeDesktop {
 
     fn open_profile(&self, dir: &Path) -> Result<()> {
         open_profile(self.sys.as_ref(), dir)
+    }
+
+    /// Titles of sessions that are mid-reply or waiting for a person, on every running profile, plus a note
+    /// for each running profile whose sessions could not be read (Claude's own quit prompt still protects).
+    fn busy_scan(&self, running: &[Instance], default: &Path) -> (Vec<String>, Vec<String>) {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for instance in running {
+            let dir = canon(instance.profile.as_deref().unwrap_or(default));
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+        let (mut titles, mut notes) = (Vec::new(), Vec::new());
+        for dir in &dirs {
+            let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| dir.display().to_string());
+            let unreadable = |why: String| format!("could not read sessions of {name} ({why}); relying on Claude's own quit prompt");
+            match profile_uuid(dir) {
+                Ok(Some(uuid)) => match session_mirror::busy_sessions(dir, &uuid) {
+                    Ok(found) => titles.extend(found),
+                    Err(why) => notes.push(unreadable(why)),
+                },
+                Ok(None) => {}
+                Err(e) => notes.push(unreadable(e.to_string())),
+            }
+        }
+        (titles, notes)
+    }
+
+    /// The refusal for a busy session. It keeps `BUSY_PREFIX` and ". Nothing was quit" so the menu bar can
+    /// read the titles.
+    fn busy_refusal(titles: &[String], notes: &[String], changed_since_offer: bool) -> String {
+        let changed = if changed_since_offer { " The busy sessions changed since Switch anyway was offered." } else { "" };
+        let notes: String = notes.iter().map(|n| format!(" Note: {n}.")).collect();
+        format!(
+            "{}{}. Nothing was quit.{changed} Wait for it to finish, \
+             or add --force (CLI) or use Switch anyway in the menu where offered to quit now and lose it.{notes}",
+            session_mirror::BUSY_PREFIX,
+            titles.join(", ")
+        )
+    }
+
+    /// The refusal text for a quit that Claude vetoed with its own dialog. It keeps the busy marker so the
+    /// menu bar can offer "Switch anyway".
+    fn veto_refusal(&self, running: &[Instance], default: &Path) -> String {
+        let (titles, notes) = self.busy_scan(running, default);
+        let titles = if titles.is_empty() { "a session Claude reports as working".to_string() } else { titles.join(", ") };
+        let notes: String = notes.iter().map(|n| format!(" Note: {n}.")).collect();
+        format!(
+            "{}{titles}. Nothing was quit. Claude is asking whether to interrupt its work. Choose Cancel to keep \
+             working. If you choose Quit anyway or Wait, Claude closes but is not switched; run the switch again \
+             afterwards. Or add --force (CLI) or use Switch anyway in the menu where offered to end it now and lose it.{notes}",
+            session_mirror::BUSY_PREFIX
+        )
+    }
+
+    /// Mirror the session records between profiles when this Desktop version is the tested one. Never
+    /// fails the switch: the result lands in `mirror_summary` or `mirror_warning`.
+    fn mirror_sessions(&self, paths: &Paths) {
+        let installed = self.version_override.clone().or_else(|| macos_apps::app_version(CLAUDE.bundle_path));
+        if installed.as_deref() != Some(TESTED_CLAUDE_DESKTOP) {
+            let found = installed.map_or_else(|| "not installed".to_string(), |v| format!("is {v}"));
+            self.mirror_warning.replace(Some(format!(
+                "sessions were not mirrored: Claude Desktop {found}, mirroring is tested with {TESTED_CLAUDE_DESKTOP}"
+            )));
+            return;
+        }
+        match session_mirror::sync(paths, || session_mirror::claude_alive(self.sys.as_ref(), paths)) {
+            Ok(outcome) => {
+                self.mirror_summary.replace(Some(outcome.line()));
+            }
+            Err(e) => {
+                self.mirror_warning.replace(Some(format!("sessions were not mirrored: {e}")));
+            }
+        }
     }
 
     fn wait_for_instance_on(&self, dir: &Path, default: &Path) -> Result<()> {
@@ -465,6 +624,9 @@ impl Surface for ClaudeDesktop {
         let default = default_profile(env.paths);
         let link = Registry::load(env.paths)?.link;
         self.reopen.replace(None);
+        self.mirror_summary.replace(None);
+        self.mirror_warning.replace(None);
+        self.precheck_notes.replace(Vec::new());
 
         let running = self.running()?;
         let all_on_target = !running.is_empty() && running.iter().all(|i| same_dir(i.profile.as_deref().unwrap_or(&default), &target));
@@ -483,8 +645,39 @@ impl Surface for ClaudeDesktop {
                     staged.account_id
                 )));
             }
-            quit_all_instances(self.sys.as_ref(), &CLAUDE, &self.quit, self.reask)?;
+            let (busy, notes) = self.busy_scan(&running, &default);
+            if !busy.is_empty() {
+                if !self.force {
+                    return Err(Error::Invalid(Self::busy_refusal(&busy, &notes, false)));
+                }
+                if let Some(offered) = &self.force_only {
+                    if !session_mirror::titles_within(&busy, offered) {
+                        return Err(Error::Invalid(Self::busy_refusal(&busy, &notes, true)));
+                    }
+                }
+            }
+            self.precheck_notes.replace(notes);
+            let claude_code = |procs: &[ProcInfo]| claude_code_pids(procs, &known_profile_dirs(env.paths));
+            match quit_all_instances_with(self.sys.as_ref(), &CLAUDE, &self.quit, self.reask, self.force, &claude_code) {
+                Ok(_) => {}
+                Err(Error::QuitVetoed { exited, .. }) => {
+                    // Claude asked its own "still working" question and the quit was cancelled. Bring back
+                    // any instance that had already left so "Nothing was quit" stays true.
+                    let mut text = self.veto_refusal(&running, &default);
+                    for instance in running.iter().filter(|i| exited.contains(&i.pid)) {
+                        let dir = canon(instance.profile.as_deref().unwrap_or(&default));
+                        if let Err(e) = self.open_profile(&dir) {
+                            text.push_str(&format!(" Could not reopen Claude on {}: {e}; open it yourself.", dir.display()));
+                        }
+                    }
+                    return Err(Error::Invalid(text));
+                }
+                Err(e) => return Err(e),
+            }
             quit_by_us = true;
+        }
+        if !all_on_target {
+            self.mirror_sessions(env.paths);
         }
 
         if link {
@@ -529,6 +722,38 @@ fn check(level: Level, detail: impl Into<String>) -> Check {
     Check { level, name: "claude desktop", detail: detail.into() }
 }
 
+/// Whether session mirroring is on, off by the user, or off for an untested version; plus what it skips.
+fn mirror_checks(env: &Env, out: &mut Vec<Check>) {
+    let installed = macos_apps::app_version(CLAUDE.bundle_path);
+    let file = session_mirror::Manifest::file(env.paths);
+    let manifest = match session_mirror::Manifest::load(&file) {
+        Ok(m) => m,
+        Err(e) => {
+            out.push(check(Level::Warn, format!("session mirror: cannot read its manifest ({e}); switches will not mirror until it is fixed")));
+            return;
+        }
+    };
+    if !manifest.enabled {
+        out.push(check(Level::Warn, "session mirror off (disabled by you; run `agent-switch desktop-sessions on`)"));
+        return;
+    }
+    if installed.as_deref() != Some(TESTED_CLAUDE_DESKTOP) {
+        let found = installed.map_or_else(|| "not installed".to_string(), |v| format!("{v} untested"));
+        out.push(check(Level::Warn, format!("session mirror off (Claude {found}; tested with {TESTED_CLAUDE_DESKTOP})")));
+        return;
+    }
+    if file.exists() {
+        let tracked = manifest.sessions.values().filter(|e| !e.deleted).count();
+        out.push(check(Level::Ok, format!("session mirror on ({tracked} sessions tracked)")));
+    } else {
+        out.push(check(Level::Ok, "session mirror on (nothing tracked yet; the first switch starts it)"));
+    }
+    match session_mirror::skipped_notes(env.paths) {
+        Ok(notes) => out.extend(notes.into_iter().map(|n| check(Level::Warn, format!("session mirror skips {n}")))),
+        Err(e) => out.push(check(Level::Warn, format!("session mirror: cannot scan the profiles ({e})"))),
+    }
+}
+
 pub fn doctor_checks(env: &Env) -> Vec<Check> {
     let mut out = Vec::new();
     match macos_apps::app_version(CLAUDE.bundle_path) {
@@ -536,6 +761,8 @@ pub fn doctor_checks(env: &Env) -> Vec<Check> {
         Some(v) => out.push(check(Level::Warn, format!("Claude {v} (tested with {TESTED_CLAUDE_DESKTOP}); re-test a switch after an update"))),
         None => out.push(check(Level::Warn, format!("{} not found", CLAUDE.bundle_path))),
     }
+
+    mirror_checks(env, &mut out);
 
     let registry = match Registry::load(env.paths) {
         Ok(r) => r,

@@ -32,6 +32,9 @@ enum Command {
         /// Also restart the app (Desktop surfaces)
         #[arg(long)]
         restart: bool,
+        /// Desktop: switch even if a session is mid-reply; that reply is lost
+        #[arg(long)]
+        force: bool,
     },
     /// Re-activate the previous account of the last switch, from its current saved login
     Undo {
@@ -88,6 +91,15 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Claude Desktop session mirroring. `off` gives each profile back its own sessions and keeps mirroring off;
+    /// `on` turns it back on for the next switch. Both need Claude closed
+    DesktopSessions {
+        /// on or off
+        action: String,
+        /// Check that the change is allowed (Claude closed, mirroring currently in the opposite state) without making it
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Print shell code that points the Codex CLI at its own login (use: eval "$(agent-switch shell-init)")
     ShellInit,
     /// Check config, state, keychain backend and saved logins
@@ -99,7 +111,7 @@ fn main() {
     let result = match cli.command {
         Command::Status => commands::status(),
         Command::List { json } => list_command::list(json),
-        Command::Switch { surface, account, restart } => commands::switch(&surface, &account, restart),
+        Command::Switch { surface, account, restart, force } => commands::switch(&surface, &account, restart, force),
         Command::Undo { surface } => commands::undo(surface.as_deref()),
         Command::Add { surface, account, id, label, from_keychain_item, config_dir, from_file, from_profile, dry_run } => commands::add(
             &surface,
@@ -109,6 +121,7 @@ fn main() {
         Command::Bind { surface, account } => commands::bind(&surface, &account),
         Command::Repair { target, dry_run } => codex_commands::repair(&target, dry_run),
         Command::DefaultLink { action, dry_run } => desktop_commands::default_link(&action, dry_run),
+        Command::DesktopSessions { action, dry_run } => desktop_commands::desktop_sessions(&action, dry_run),
         Command::ShellInit => codex_commands::shell_init(),
         Command::Doctor => commands::doctor(),
     };

@@ -8,7 +8,7 @@ use agent_switch_core::macos_apps::SystemApps;
 use agent_switch_core::paths::Paths;
 use agent_switch_core::signing::detect_keychain;
 use agent_switch_core::state::State;
-use agent_switch_core::surface::Env;
+use agent_switch_core::surface::{Env, Surface};
 use agent_switch_core::switch;
 use agent_switch_core::vault::Vault;
 use agent_switch_core::{Error, Result};
@@ -75,19 +75,41 @@ pub fn status() -> Result<Code> {
     Ok(0)
 }
 
-pub fn switch(surface: &str, account: &str, restart: bool) -> Result<Code> {
+pub fn switch(surface: &str, account: &str, restart: bool, force: bool) -> Result<Code> {
     let kind: SurfaceKind = surface.parse()?;
     let app = App::open()?;
     let config = Config::load(&app.paths)?;
     if config.surfaces.get(kind).account_id().is_none() {
         return Err(Error::Invalid(format!("`{kind}` is unmanaged; run `agent-switch bind {kind} {account}` first")));
     }
-    let surf = surface_for_switch(kind, restart);
-    switch::activate(&app.env(), &config, surf.as_ref(), account)?;
+    // `--force` only matters to Claude Desktop (a session mid-reply); other surfaces ignore it.
+    let desktop = (kind == SurfaceKind::ClaudeDesktop).then(|| {
+        let d = claude_desktop::ClaudeDesktop::production();
+        let d = if restart { d.with_restart() } else { d };
+        if force { d.with_force() } else { d }
+    });
+    let other;
+    let surf: &dyn Surface = match &desktop {
+        Some(d) => d,
+        None => {
+            other = surface_for_switch(kind, restart);
+            other.as_ref()
+        }
+    };
+    let env = app.env();
+    switch::activate(&env, &config, surf, account)?;
     if restart {
-        surf.restart(&app.env())?;
+        surf.restart(&env)?;
     }
     println!("{kind}: switched to {account}");
+    if let Some(d) = &desktop {
+        if let Some(line) = d.mirror_summary() {
+            println!("{line}");
+        }
+        if let Some(warning) = d.mirror_warning() {
+            println!("warning: {warning}");
+        }
+    }
     if let Some(note) = switch_note(kind) {
         println!("{note}");
     }

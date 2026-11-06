@@ -313,7 +313,7 @@ fn users_of(procs: &[ProcInfo], dir: &Path) -> Vec<u32> {
 /// Quit Claude and wait for every process that still runs from `dir`. Moving a folder under a live process
 /// would split its writes between two places.
 fn quiesce(sys: &dyn System, dir: &Path, quit: &QuitOpts, reask: Duration) -> Result<()> {
-    quit_all_instances(sys, &CLAUDE, quit, reask)?;
+    quit_all_instances(sys, &CLAUDE, quit, reask, false)?;
     let deadline = Instant::now() + quit.timeout;
     loop {
         let users = users_of(&sys.processes()?, dir);

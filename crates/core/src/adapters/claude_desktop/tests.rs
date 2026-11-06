@@ -109,7 +109,9 @@ impl Fx {
     }
 
     fn adapter(&self, sys: &Rc<FakeSystem>) -> ClaudeDesktop {
-        ClaudeDesktop::with_system(Box::new(sys.clone())).with_timing(quick(), reask(), Duration::from_millis(300), Duration::ZERO)
+        ClaudeDesktop::with_system(Box::new(sys.clone()))
+            .with_timing(quick(), reask(), Duration::from_millis(300), Duration::ZERO)
+            .with_desktop_version(TESTED_CLAUDE_DESKTOP)
     }
 
     fn account(&self, id: &str) -> Account {
@@ -833,4 +835,380 @@ fn doctor_reports_each_registered_profile() {
     assert!(text.iter().any(|t| t.contains("profile `team`: signed in")), "{text:?}");
     assert!(text.iter().any(|t| t.contains("default folder")), "{text:?}");
     assert!(checks.iter().all(|c| !c.detail.contains(COOKIE_VALUE)));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Session mirror and busy guard
+// ---------------------------------------------------------------------------------------------
+
+const S1: &str = "local_11111111-0000-4000-8000-0000000000a1";
+const S2: &str = "local_22222222-0000-4000-8000-0000000000a2";
+
+fn session(id: &str, turns: i64) -> serde_json::Value {
+    serde_json::json!({
+        "sessionId": id, "cliSessionId": format!("cli-{id}"), "lastTurnEdgeAt": turns * 100, "completedTurns": turns,
+        "isArchived": false, "createdAt": 1, "lastActivityAt": turns * 100, "title": format!("title {id}")
+    })
+}
+
+fn session_folder(profile: &Path, uuid: &str) -> PathBuf {
+    let dir = profile.join("claude-code-sessions").join(uuid).join("org");
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn put_session(profile: &Path, uuid: &str, value: &serde_json::Value) {
+    let id = value["sessionId"].as_str().unwrap();
+    fs::write(session_folder(profile, uuid).join(format!("{id}.json")), serde_json::to_vec(value).unwrap()).unwrap();
+}
+
+fn has_session(profile: &Path, uuid: &str, id: &str) -> bool {
+    session_folder(profile, uuid).join(format!("{id}.json")).exists()
+}
+
+fn busy_session(id: &str) -> serde_json::Value {
+    let mut v = session(id, 2);
+    v["latestUserFrameAt"] = serde_json::json!(999_999);
+    v
+}
+
+#[test]
+fn apply_refuses_when_busy() {
+    let (fx, team, config) = bound_fixture();
+    put_session(&fx.default(), U_PERSONAL, &busy_session(S1));
+    put_session(&team, U_TEAM, &session(S2, 1));
+    let sys = Rc::new(FakeSystem::new(true));
+    sys.add(10, MAIN);
+    let a = fx.adapter(&sys).with_restart();
+    let err = switch::activate(&fx.env(), &config, &a, "team").unwrap_err().to_string();
+    assert!(err.contains(&format!("title {S1}")) && err.contains("--force") && err.contains("Switch anyway"), "{err}");
+    assert_eq!(*sys.quit_calls.borrow(), 0, "nothing is quit");
+    assert!(!has_session(&team, U_TEAM, S1), "nothing is mirrored either");
+    assert_eq!(State::load(&fx.paths).unwrap().active(SurfaceKind::ClaudeDesktop), None);
+}
+
+#[test]
+fn apply_force_quits_when_busy() {
+    let (fx, team, config) = bound_fixture();
+    put_session(&fx.default(), U_PERSONAL, &busy_session(S1));
+    session_folder(&team, U_TEAM);
+    let sys = Rc::new(FakeSystem::new(true));
+    sys.add(10, MAIN);
+    let a = fx.adapter(&sys).with_restart().with_force();
+    switch::activate(&fx.env(), &config, &a, "team").unwrap();
+    assert!(*sys.quit_calls.borrow() > 0);
+    assert!(has_session(&team, U_TEAM, S1));
+}
+
+fn vetoing_system() -> Rc<FakeSystem> {
+    let mut fake = FakeSystem::new(true);
+    fake.quit_vetoed = true;
+    let sys = Rc::new(fake);
+    sys.add(10, MAIN);
+    sys
+}
+
+#[test]
+fn quit_veto_is_a_busy_refusal_that_names_sessions() {
+    let (fx, team, _config) = bound_fixture();
+    // The file guard sees nothing busy; Claude's own dialog is what stops the quit. The record that does
+    // carry a pending user frame is named in the refusal.
+    put_session(&fx.default(), U_PERSONAL, &busy_session(S1));
+    put_session(&team, U_TEAM, &session(S2, 1));
+    let sys = vetoing_system();
+    let a = fx.adapter(&sys).with_restart();
+    // The pre-check cannot fire for a record Claude stamps late, so the veto path rescans the files itself.
+    let err = a.veto_refusal(&a.running().unwrap(), &fx.default());
+    assert!(err.contains(&format!("title {S1}")), "{err}");
+    assert!(err.contains("Nothing was quit") && err.contains("Choose Cancel") && err.contains("run the switch again"), "{err}");
+    assert!(err.contains("Switch anyway") && err.contains("--force"), "{err}");
+    assert_eq!(session_mirror::busy_titles_in(&err).as_deref(), Some(&format!("title {S1}")[..]));
+}
+
+#[test]
+fn quit_veto_without_busy_records_still_refuses() {
+    let (fx, _team, config) = bound_fixture();
+    let sys = vetoing_system();
+    let a = fx.adapter(&sys).with_restart();
+    let err = switch::activate(&fx.env(), &config, &a, "team").unwrap_err().to_string();
+    assert!(err.starts_with(session_mirror::BUSY_PREFIX) && err.contains("a session Claude reports as working"), "{err}");
+    assert_eq!(session_mirror::busy_titles_in(&err).as_deref(), Some("a session Claude reports as working"));
+    assert!(sys.terminated.borrow().is_empty());
+    assert_eq!(State::load(&fx.paths).unwrap().active(SurfaceKind::ClaudeDesktop), None, "a refused switch is not recorded");
+}
+
+#[test]
+fn quit_veto_never_mirrors() {
+    let (fx, team, config) = bound_fixture();
+    put_session(&fx.default(), U_PERSONAL, &session(S1, 3));
+    put_session(&team, U_TEAM, &session(S2, 1));
+    let sys = vetoing_system();
+    let a = fx.adapter(&sys).with_restart();
+    assert!(switch::activate(&fx.env(), &config, &a, "team").is_err());
+    assert!(!has_session(&team, U_TEAM, S1) && !has_session(&fx.default(), U_PERSONAL, S2));
+    assert!(!session_mirror::Manifest::file(&fx.paths).exists());
+    assert_eq!(a.mirror_summary(), None);
+}
+
+#[test]
+fn quit_veto_after_one_instance_left_reopens_it() {
+    let (fx, _team, config) = bound_fixture();
+    let mut fake = FakeSystem::new(true);
+    fake.quit_vetoed = true;
+    fake.quit_one_per_request = true;
+    fake.veto_after = 1;
+    let sys = Rc::new(fake);
+    sys.add(10, MAIN);
+    sys.add(20, &format!("{MAIN} --user-data-dir={}", fx.default().display()));
+    let a = fx.adapter(&sys).with_restart();
+    assert!(switch::activate(&fx.env(), &config, &a, "team").is_err());
+    assert_eq!(sys.opened_args.borrow().len(), 1, "the instance that already quit is opened again");
+}
+
+#[test]
+fn forced_switch_after_veto_mirrors_and_reopens() {
+    let (fx, team, config) = bound_fixture();
+    put_session(&fx.default(), U_PERSONAL, &session(S1, 3));
+    put_session(&team, U_TEAM, &session(S2, 1));
+    let mut fake = FakeSystem::new(true);
+    fake.quit_vetoed = true;
+    fake.spawn_on_open = true;
+    let sys = Rc::new(fake);
+    sys.add(10, MAIN);
+    let a = fx.adapter(&sys).with_restart().with_force();
+    switch::activate(&fx.env(), &config, &a, "team").unwrap();
+    assert_eq!(*sys.terminated.borrow(), vec![10], "SIGTERM after the veto");
+    assert!(has_session(&team, U_TEAM, S1) && has_session(&fx.default(), U_PERSONAL, S2));
+    a.restart(&fx.env()).unwrap();
+    assert_eq!(sys.opened_args.borrow().len(), 1);
+    assert_eq!(State::load(&fx.paths).unwrap().active(SurfaceKind::ClaudeDesktop), Some("team"));
+}
+
+#[test]
+fn apply_skips_mirror_on_untested_version() {
+    let (fx, team, config) = bound_fixture();
+    put_session(&fx.default(), U_PERSONAL, &session(S1, 1));
+    session_folder(&team, U_TEAM);
+    let sys = Rc::new(FakeSystem::new(true));
+    let a = fx.adapter(&sys).with_desktop_version("0.0.1");
+    switch::activate(&fx.env(), &config, &a, "team").unwrap();
+    assert!(!has_session(&team, U_TEAM, S1));
+    assert_eq!(a.mirror_summary(), None);
+    let warning = a.mirror_warning().unwrap();
+    assert!(warning.contains("0.0.1") && warning.contains(TESTED_CLAUDE_DESKTOP), "{warning}");
+    assert!(!session_mirror::Manifest::file(&fx.paths).exists());
+}
+
+#[test]
+fn apply_mirrors_before_reopen() {
+    let (fx, team, config) = bound_fixture();
+    put_session(&fx.default(), U_PERSONAL, &session(S1, 3));
+    put_session(&team, U_TEAM, &session(S2, 1));
+    let mut fake = FakeSystem::new(true);
+    fake.spawn_on_open = true;
+    let sys = Rc::new(fake);
+    sys.add(10, MAIN);
+    let a = fx.adapter(&sys).with_restart();
+    switch::activate(&fx.env(), &config, &a, "team").unwrap();
+    // Both lists are complete and the app has not been reopened yet.
+    assert!(has_session(&team, U_TEAM, S1) && has_session(&fx.default(), U_PERSONAL, S2));
+    assert!(sys.opened_args.borrow().is_empty());
+    assert_eq!(a.mirror_summary().as_deref(), Some("sessions: 2 mirrored, 0 backed up"));
+    assert_eq!(a.mirror_warning(), None);
+    assert_eq!(fs::read(team.join("claude-code-sessions").join(U_TEAM).join("org").join(format!("{S1}.json"))).unwrap(), serde_json::to_vec(&session(S1, 3)).unwrap());
+    a.restart(&fx.env()).unwrap();
+    assert_eq!(sys.opened_args.borrow().len(), 1);
+}
+
+#[test]
+fn mirror_off_restores_origin_lists() {
+    let (fx, team, config) = bound_fixture();
+    put_session(&fx.default(), U_PERSONAL, &session(S1, 3));
+    put_session(&team, U_TEAM, &session(S2, 1));
+    let sys = Rc::new(FakeSystem::new(true));
+    let a = fx.adapter(&sys);
+    switch::activate(&fx.env(), &config, &a, "team").unwrap();
+    assert!(has_session(&team, U_TEAM, S1) && has_session(&fx.default(), U_PERSONAL, S2));
+    // The team copy of S1 gains a turn while mirrored.
+    put_session(&team, U_TEAM, &session(S1, 4));
+
+    // Refused while Claude runs.
+    sys.add(10, MAIN);
+    assert!(session_mirror::mirror_off(&fx.paths, sys.as_ref()).unwrap_err().to_string().contains("running"));
+    sys.procs.borrow_mut().clear();
+
+    session_mirror::mirror_off(&fx.paths, sys.as_ref()).unwrap();
+    // Each profile lists exactly its original sessions; origins hold the newest content.
+    assert!(has_session(&fx.default(), U_PERSONAL, S1) && !has_session(&fx.default(), U_PERSONAL, S2));
+    assert!(has_session(&team, U_TEAM, S2) && !has_session(&team, U_TEAM, S1));
+    let newest: serde_json::Value = serde_json::from_slice(&fs::read(session_folder(&fx.default(), U_PERSONAL).join(format!("{S1}.json"))).unwrap()).unwrap();
+    assert_eq!(newest["completedTurns"], 4);
+    assert!(!session_mirror::Manifest::load(&session_mirror::Manifest::file(&fx.paths)).unwrap().enabled);
+    // The removed copies are in the backup folder, not unlinked.
+    let backups = backups_dir(&fx.paths).join("sessions");
+    let moved = fs::read_dir(&backups).unwrap().map(|e| e.unwrap().path()).any(|stamp| stamp.join("team").join(format!("{S1}.json")).exists());
+    assert!(moved);
+}
+
+#[test]
+fn mirror_off_stays_off_on_next_sync() {
+    let (fx, team, config) = bound_fixture();
+    put_session(&fx.default(), U_PERSONAL, &session(S1, 3));
+    put_session(&team, U_TEAM, &session(S2, 1));
+    let sys = Rc::new(FakeSystem::new(true));
+    let a = fx.adapter(&sys);
+    switch::activate(&fx.env(), &config, &a, "team").unwrap();
+    session_mirror::mirror_off(&fx.paths, sys.as_ref()).unwrap();
+    assert!(!has_session(&team, U_TEAM, S1));
+
+    switch::activate(&fx.env(), &config, &a, "personal").unwrap();
+    assert_eq!(a.mirror_summary().as_deref(), Some("session mirroring is off"));
+    assert!(!has_session(&team, U_TEAM, S1) && !has_session(&fx.default(), U_PERSONAL, S2), "the next switch mirrors nothing");
+
+    session_mirror::mirror_on(&fx.paths).unwrap();
+    switch::activate(&fx.env(), &config, &a, "team").unwrap();
+    assert!(has_session(&team, U_TEAM, S1) && has_session(&fx.default(), U_PERSONAL, S2));
+}
+
+#[test]
+fn stale_switch_anyway_rechecks_busy_set() {
+    let (fx, team, config) = bound_fixture();
+    put_session(&fx.default(), U_PERSONAL, &busy_session(S1));
+    session_folder(&team, U_TEAM);
+
+    // The user saw a different busy session in the offer: the one busy now is refused, nothing is quit.
+    let sys = Rc::new(FakeSystem::new(true));
+    sys.add(10, MAIN);
+    let a = fx.adapter(&sys).with_restart().with_force_if_only("title some-other-session");
+    let err = switch::activate(&fx.env(), &config, &a, "team").unwrap_err().to_string();
+    assert_eq!(session_mirror::busy_titles_in(&err).as_deref(), Some(&format!("title {S1}")[..]), "{err}");
+    assert!(err.contains("changed since Switch anyway was offered"), "{err}");
+    assert_eq!(*sys.quit_calls.borrow(), 0, "nothing is quit");
+    assert!(sys.terminated.borrow().is_empty());
+
+    // The same session, inside a longer offer, may be forced.
+    let a = fx.adapter(&sys).with_restart().with_force_if_only(format!("title other, title {S1}"));
+    switch::activate(&fx.env(), &config, &a, "team").unwrap();
+    assert!(*sys.quit_calls.borrow() > 0);
+
+    // A title that merely contains an offered one is not the same session.
+    assert!(session_mirror::titles_within(&["a, b".to_string()], "x, a, b"));
+    assert!(!session_mirror::titles_within(&["a".to_string()], "ab, c"));
+    assert!(!session_mirror::titles_within(&["b".to_string()], "a, bc"));
+}
+
+#[test]
+fn unreadable_sessions_of_a_running_profile_are_reported_not_fatal() {
+    let (fx, team, config) = bound_fixture();
+    put_session(&fx.default(), U_PERSONAL, &session(S1, 1));
+    // A second organization folder: the app's folder cannot be told apart.
+    fs::create_dir_all(fx.default().join("claude-code-sessions").join(U_PERSONAL).join("org-two")).unwrap();
+    session_folder(&team, U_TEAM);
+    let sys = Rc::new(FakeSystem::new(true));
+    sys.add(10, MAIN);
+    let a = fx.adapter(&sys).with_restart();
+    switch::activate(&fx.env(), &config, &a, "team").unwrap();
+    let warning = a.mirror_warning().unwrap();
+    assert!(warning.contains("could not read sessions of Claude") && warning.contains("relying on Claude's own quit prompt"), "{warning}");
+
+    // The Claude veto refusal carries the note after the parsed markers.
+    let sys = vetoing_system();
+    let a = fx.adapter(&sys).with_restart();
+    let text = a.veto_refusal(&a.running().unwrap(), &fx.default());
+    assert!(text.contains("Note: could not read sessions of Claude"), "{text}");
+    assert_eq!(session_mirror::busy_titles_in(&text).as_deref(), Some("a session Claude reports as working"));
+}
+
+#[test]
+fn busy_refusal_text_does_not_promise_a_menu_force_everywhere() {
+    let (fx, team, config) = bound_fixture();
+    put_session(&fx.default(), U_PERSONAL, &busy_session(S1));
+    session_folder(&team, U_TEAM);
+    let sys = Rc::new(FakeSystem::new(true));
+    sys.add(10, MAIN);
+    let a = fx.adapter(&sys).with_restart();
+    let err = switch::activate(&fx.env(), &config, &a, "team").unwrap_err().to_string();
+    assert!(err.contains("--force (CLI) or use Switch anyway in the menu where offered"), "{err}");
+}
+
+const AGENT: &str = "claude-code/2.1.50/abc123/claude.app/Contents/MacOS/claude --output-format stream-json";
+
+#[test]
+fn claude_code_agents_under_a_profile_are_found_and_terminal_claude_is_not() {
+    let (fx, team, _config) = bound_fixture();
+    let dirs = known_profile_dirs(&fx.paths);
+    let procs = vec![
+        ProcInfo { pid: 30, command: format!("{}/{AGENT}", fx.default().display()) },
+        ProcInfo { pid: 31, command: format!("{}/{AGENT}", team.display()) },
+        ProcInfo { pid: 40, command: "claude --resume".into() },
+        ProcInfo { pid: 41, command: "/opt/homebrew/bin/claude".into() },
+        ProcInfo { pid: 42, command: format!("{}/claude-code/2.1.50/claude", fx.default().display()) },
+        ProcInfo { pid: 43, command: format!("/elsewhere/{AGENT}") },
+    ];
+    // Both profile folders are known; a path elsewhere, a plain `claude` and a non-agent file are not matched.
+    assert_eq!(claude_code_pids(&procs, &dirs), vec![30, 31]);
+    assert_eq!(claude_code_pids(&procs, &[fx.default()]), vec![30]);
+}
+
+#[test]
+fn the_quit_waits_for_claude_code_agents_and_force_ends_them_after_the_app() {
+    let (fx, team, config) = bound_fixture();
+    session_folder(&team, U_TEAM);
+    // Normal quit: the app leaves, its agent stays, so the switch times out naming the agent only.
+    let sys = Rc::new(FakeSystem::new(true));
+    sys.add(10, MAIN);
+    sys.add(30, &format!("{}/{AGENT}", fx.default().display()));
+    sys.add(40, "claude --resume");
+    let a = fx.adapter(&sys).with_restart();
+    let err = switch::activate(&fx.env(), &config, &a, "team").unwrap_err().to_string();
+    assert!(err.contains("did not quit") && err.contains("30") && !err.contains("40"), "{err}");
+    assert!(session_mirror::claude_alive(sys.as_ref(), &fx.paths), "an agent alone keeps the mirror from running");
+
+    // Forced after a veto: the app first, then the agent, never the terminal claude.
+    let mut fake = FakeSystem::new(true);
+    fake.quit_vetoed = true;
+    let sys = Rc::new(fake);
+    sys.add(10, MAIN);
+    sys.add(30, &format!("{}/{AGENT}", fx.default().display()));
+    sys.add(40, "claude --resume");
+    let a = fx.adapter(&sys).with_restart().with_force();
+    switch::activate(&fx.env(), &config, &a, "team").unwrap();
+    assert_eq!(*sys.terminated.borrow(), vec![10, 30]);
+    assert!(sys.processes().unwrap().iter().any(|p| p.pid == 40));
+    assert!(!session_mirror::claude_alive(sys.as_ref(), &fx.paths), "only the terminal claude is left");
+}
+
+#[test]
+fn a_failed_reopen_after_a_partial_veto_is_reported() {
+    let (fx, _team, config) = bound_fixture();
+    let mut fake = FakeSystem::new(true);
+    fake.quit_vetoed = true;
+    fake.quit_one_per_request = true;
+    fake.veto_after = 1;
+    fake.open_fails = true;
+    let sys = Rc::new(fake);
+    sys.add(10, MAIN);
+    sys.add(20, &format!("{MAIN} --user-data-dir={}", fx.default().display()));
+    let a = fx.adapter(&sys).with_restart();
+    let err = switch::activate(&fx.env(), &config, &a, "team").unwrap_err().to_string();
+    assert!(err.contains("Nothing was quit") && err.contains("Could not reopen Claude on") && err.contains("open it yourself"), "{err}");
+    assert!(session_mirror::busy_titles_in(&err).is_some());
+}
+
+#[test]
+fn mirror_off_with_pending_deletion_completes() {
+    let (fx, team, config) = bound_fixture();
+    put_session(&fx.default(), U_PERSONAL, &session(S1, 3));
+    put_session(&team, U_TEAM, &session(S2, 1));
+    let sys = Rc::new(FakeSystem::new(true));
+    let a = fx.adapter(&sys);
+    switch::activate(&fx.env(), &config, &a, "team").unwrap();
+    assert!(has_session(&team, U_TEAM, S1));
+    // The session is deleted in its origin profile; the other copy is still waiting to be moved away.
+    fs::remove_file(session_folder(&fx.default(), U_PERSONAL).join(format!("{S1}.json"))).unwrap();
+    session_mirror::mirror_off(&fx.paths, sys.as_ref()).unwrap();
+    assert!(!has_session(&team, U_TEAM, S1) && !has_session(&fx.default(), U_PERSONAL, S1));
+    let backups = backups_dir(&fx.paths).join("sessions");
+    let moved = fs::read_dir(&backups).unwrap().map(|e| e.unwrap().path()).any(|stamp| stamp.join("team").join(format!("{S1}.json")).exists());
+    assert!(moved, "the surviving copy is in the backup folder");
 }

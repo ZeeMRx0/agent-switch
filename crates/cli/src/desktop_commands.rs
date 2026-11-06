@@ -103,3 +103,37 @@ pub fn default_link(action: &str, dry_run: bool) -> Result<i32> {
     }
     Ok(0)
 }
+
+/// `agent-switch desktop-sessions on|off [--dry-run]`. Both refuse while Claude runs, because the session
+/// folders are in use. `--dry-run` checks that and says what would happen; it writes nothing.
+pub fn desktop_sessions(action: &str, dry_run: bool) -> Result<i32> {
+    use agent_switch_core::adapters::claude_desktop::session_mirror::{self, Manifest};
+
+    if !matches!(action, "on" | "off") {
+        return Err(Error::Invalid(format!("unknown action `{action}`; use `on` or `off`")));
+    }
+    let app = App::open()?;
+    let manifest = Manifest::load(&Manifest::file(&app.paths))?;
+    if session_mirror::claude_alive(&SystemApps, &app.paths) {
+        return Err(Error::Invalid(format!("Claude is running; quit it before turning session mirroring {action}")));
+    }
+    let tracked = manifest.sessions.values().filter(|e| !e.deleted).count();
+    match (action, manifest.enabled) {
+        ("off", false) => println!("claude-desktop: session mirroring is already off (turn it back on with `agent-switch desktop-sessions on`)"),
+        ("off", true) if dry_run => println!(
+            "claude-desktop: would turn session mirroring off: {tracked} tracked session(s) go back to the profile they came from with their newest content, other copies move to the backup folder, and later switches stop mirroring"
+        ),
+        ("off", true) => {
+            let outcome = session_mirror::mirror_off(&app.paths, &SystemApps)?;
+            println!("claude-desktop: session mirroring is off ({})", outcome.line());
+            println!("turn it back on with `agent-switch desktop-sessions on`");
+        }
+        (_, true) => println!("claude-desktop: session mirroring is already on"),
+        (_, false) if dry_run => println!("claude-desktop: would turn session mirroring on; the next switch syncs the sessions each profile has"),
+        (_, false) => {
+            session_mirror::mirror_on(&app.paths)?;
+            println!("claude-desktop: session mirroring is on; the next switch syncs the sessions each profile has");
+        }
+    }
+    Ok(0)
+}

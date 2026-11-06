@@ -57,13 +57,22 @@ impl ProcInfo {
     }
 }
 
+/// What a quit request got back from the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuitReply {
+    /// The request was delivered; the app may still take a while to leave, or refuse later.
+    Sent,
+    /// The app showed its own "still working" dialog and the quit was cancelled (AppleScript error -128).
+    Vetoed,
+}
+
 /// Everything the quit-and-wait logic needs from the machine.
 pub trait System {
     fn processes(&self) -> Result<Vec<ProcInfo>>;
     /// The value of environment variable `key` in process `pid`, when the OS shows it to us.
     fn env_var(&self, pid: u32, key: &str) -> Result<Option<String>>;
     /// Ask the app to quit (AppleScript). Does nothing when the app is not running.
-    fn request_quit(&self, target: &AppTarget) -> Result<()>;
+    fn request_quit(&self, target: &AppTarget) -> Result<QuitReply>;
     fn open(&self, target: &AppTarget) -> Result<()>;
     /// Start a new instance of the app (`open -n`) with command-line arguments after `--args`.
     fn open_new_with_args(&self, target: &AppTarget, args: &[String]) -> Result<()>;
@@ -141,7 +150,9 @@ pub fn quit_and_wait(
     if alive(sys)?.is_empty() {
         return Ok(false);
     }
-    sys.request_quit(target)?;
+    if sys.request_quit(target)? == QuitReply::Vetoed {
+        return Err(Error::QuitVetoed { app: target.name, exited: Vec::new() });
+    }
     let deadline = Instant::now() + opts.timeout;
     loop {
         let pids = alive(sys)?;
@@ -164,9 +175,36 @@ pub fn quit_and_wait(
 /// Quit every instance of `target` and wait until no process of it is left. A scripted quit reaches one
 /// instance per request, so the request is repeated every `reask` while anything is alive. Returns
 /// `Ok(true)` when something was running and is now gone. Fails naming the PIDs still alive after the timeout.
-pub fn quit_all_instances(sys: &dyn System, target: &AppTarget, opts: &QuitOpts, reask: Duration) -> Result<bool> {
-    let alive = || -> Result<Vec<u32>> { Ok(bundle_pids(&sys.processes()?, target)) };
-    if alive()?.is_empty() {
+///
+/// When the app vetoes the request with its own dialog: without `force` this fails with
+/// `Error::QuitVetoed` (carrying the PIDs that had already exited), and with `force` every process of the
+/// app gets SIGTERM and the wait continues. The app is never killed harder than SIGTERM.
+pub fn quit_all_instances(sys: &dyn System, target: &AppTarget, opts: &QuitOpts, reask: Duration, force: bool) -> Result<bool> {
+    quit_all_instances_with(sys, target, opts, reask, force, &|_| Vec::new())
+}
+
+/// `quit_all_instances` that also waits for the processes `extra` names (children that run outside the app
+/// bundle). They count as alive and, with `force`, get SIGTERM after the bundle's own processes.
+pub fn quit_all_instances_with(
+    sys: &dyn System,
+    target: &AppTarget,
+    opts: &QuitOpts,
+    reask: Duration,
+    force: bool,
+    extra: &dyn Fn(&[ProcInfo]) -> Vec<u32>,
+) -> Result<bool> {
+    let alive = || -> Result<Vec<u32>> {
+        let procs = sys.processes()?;
+        let mut pids = bundle_pids(&procs, target);
+        for pid in extra(&procs) {
+            if !pids.contains(&pid) {
+                pids.push(pid);
+            }
+        }
+        Ok(pids)
+    };
+    let initial = alive()?;
+    if initial.is_empty() {
         return Ok(false);
     }
     let deadline = Instant::now() + opts.timeout;
@@ -187,7 +225,16 @@ pub fn quit_all_instances(sys: &dyn System, target: &AppTarget, opts: &QuitOpts,
             )));
         }
         if now >= next_request {
-            sys.request_quit(target)?;
+            if sys.request_quit(target)? == QuitReply::Vetoed {
+                if !force {
+                    let exited = initial.iter().copied().filter(|p| !pids.contains(p)).collect();
+                    return Err(Error::QuitVetoed { app: target.name, exited });
+                }
+                for pid in &pids {
+                    // A process may have left since the listing; the wait below reports any that stay.
+                    let _ = sys.terminate(*pid);
+                }
+            }
             next_request = now + reask;
         }
         std::thread::sleep(opts.poll);
@@ -258,7 +305,7 @@ impl System for SystemApps {
         Ok(env_from_ps_line(&String::from_utf8_lossy(&out.stdout), key))
     }
 
-    fn request_quit(&self, target: &AppTarget) -> Result<()> {
+    fn request_quit(&self, target: &AppTarget) -> Result<QuitReply> {
         let id = target.bundle_id;
         if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
             return Err(Error::Invalid(format!("unsafe bundle id `{id}`")));
@@ -275,9 +322,12 @@ impl System for SystemApps {
         if out.code != 0 {
             // `osascript` errors never contain secrets; its first line is the useful part.
             let msg = String::from_utf8_lossy(&out.stderr);
+            if msg.contains("(-128)") {
+                return Ok(QuitReply::Vetoed); // "User canceled": the app's own dialog was answered with Cancel
+            }
             return Err(Error::Invalid(format!("asking {} to quit failed: {}", target.name, msg.lines().next().unwrap_or("").trim())));
         }
-        Ok(())
+        Ok(QuitReply::Sent)
     }
 
     fn open(&self, target: &AppTarget) -> Result<()> {
@@ -330,6 +380,11 @@ pub mod fake {
         /// When true, `open_new_with_args` starts a main process carrying the arguments.
         pub spawn_on_open: bool,
         pub terminated: RefCell<Vec<u32>>,
+        /// When true, `request_quit` answers `Vetoed` once `veto_after` requests have been served.
+        pub quit_vetoed: bool,
+        pub veto_after: u32,
+        /// When true, `open_new_with_args` fails.
+        pub open_fails: bool,
     }
 
     impl FakeSystem {
@@ -350,7 +405,7 @@ pub mod fake {
         fn env_var(&self, pid: u32, key: &str) -> Result<Option<String>> {
             self.as_ref().env_var(pid, key)
         }
-        fn request_quit(&self, target: &AppTarget) -> Result<()> {
+        fn request_quit(&self, target: &AppTarget) -> Result<QuitReply> {
             self.as_ref().request_quit(target)
         }
         fn open(&self, target: &AppTarget) -> Result<()> {
@@ -371,8 +426,11 @@ pub mod fake {
         fn env_var(&self, pid: u32, key: &str) -> Result<Option<String>> {
             Ok(self.env.borrow().get(&(pid, key.to_string())).cloned())
         }
-        fn request_quit(&self, target: &AppTarget) -> Result<()> {
+        fn request_quit(&self, target: &AppTarget) -> Result<QuitReply> {
             *self.quit_calls.borrow_mut() += 1;
+            if self.quit_vetoed && *self.quit_calls.borrow() > self.veto_after {
+                return Ok(QuitReply::Vetoed);
+            }
             if self.quit_works {
                 let prefix = format!("{}/Contents/", target.bundle_path);
                 if self.quit_one_per_request {
@@ -384,13 +442,16 @@ pub mod fake {
                     self.procs.borrow_mut().retain(|p| !p.command.starts_with(&prefix));
                 }
             }
-            Ok(())
+            Ok(QuitReply::Sent)
         }
         fn open(&self, target: &AppTarget) -> Result<()> {
             self.opened.borrow_mut().push(target.name);
             Ok(())
         }
         fn open_new_with_args(&self, target: &AppTarget, args: &[String]) -> Result<()> {
+            if self.open_fails {
+                return Err(Error::Invalid(format!("could not open {}", target.name)));
+            }
             self.opened.borrow_mut().push(target.name);
             self.opened_args.borrow_mut().push(args.to_vec());
             if self.spawn_on_open {
@@ -490,7 +551,7 @@ mod tests {
         sys.add(20, &format!("{CLAUDE_MAIN} --user-data-dir=/p/team"));
         sys.add(21, CLAUDE_HELPER);
         let (opts, reask) = short();
-        assert!(quit_all_instances(&sys, &CLAUDE, &opts, reask).unwrap());
+        assert!(quit_all_instances(&sys, &CLAUDE, &opts, reask, false).unwrap());
         assert!(*sys.quit_calls.borrow() >= 3, "one request per process is needed here");
         assert!(bundle_pids(&sys.processes().unwrap(), &CLAUDE).is_empty());
     }
@@ -501,7 +562,7 @@ mod tests {
         sys.add(10, CLAUDE_MAIN);
         sys.add(20, &format!("{CLAUDE_MAIN} --user-data-dir=/p/team"));
         let (opts, reask) = short();
-        let err = quit_all_instances(&sys, &CLAUDE, &opts, reask).unwrap_err().to_string();
+        let err = quit_all_instances(&sys, &CLAUDE, &opts, reask, false).unwrap_err().to_string();
         assert!(err.contains("Claude did not quit") && err.contains("10, 20"), "{err}");
     }
 
@@ -509,8 +570,83 @@ mod tests {
     fn quit_all_with_nothing_running_sends_no_request() {
         let sys = FakeSystem::new(true);
         let (opts, reask) = short();
-        assert!(!quit_all_instances(&sys, &CLAUDE, &opts, reask).unwrap());
+        assert!(!quit_all_instances(&sys, &CLAUDE, &opts, reask, false).unwrap());
         assert_eq!(*sys.quit_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn vetoed_quit_without_force_refuses_without_signalling() {
+        let mut sys = FakeSystem::new(true);
+        sys.quit_vetoed = true;
+        sys.add(10, CLAUDE_MAIN);
+        sys.add(20, &format!("{CLAUDE_MAIN} --user-data-dir=/p/team"));
+        let (opts, reask) = short();
+        let err = quit_all_instances(&sys, &CLAUDE, &opts, reask, false).unwrap_err();
+        assert!(matches!(err, Error::QuitVetoed { app: "Claude", ref exited } if exited.is_empty()), "{err:?}");
+        assert!(sys.terminated.borrow().is_empty(), "no signal without --force");
+        assert_eq!(bundle_pids(&sys.processes().unwrap(), &CLAUDE), vec![10, 20]);
+    }
+
+    #[test]
+    fn a_veto_after_one_instance_left_reports_it_as_exited() {
+        let mut sys = FakeSystem::new(true);
+        sys.quit_one_per_request = true;
+        sys.quit_vetoed = true;
+        sys.veto_after = 1;
+        sys.add(10, CLAUDE_MAIN);
+        sys.add(20, &format!("{CLAUDE_MAIN} --user-data-dir=/p/team"));
+        let (opts, reask) = short();
+        let err = quit_all_instances(&sys, &CLAUDE, &opts, reask, false).unwrap_err();
+        assert!(matches!(err, Error::QuitVetoed { ref exited, .. } if exited == &vec![10]), "{err:?}");
+    }
+
+    #[test]
+    fn vetoed_quit_with_force_terminates_and_waits() {
+        let mut sys = FakeSystem::new(true);
+        sys.quit_vetoed = true;
+        sys.add(10, CLAUDE_MAIN);
+        sys.add(21, CLAUDE_HELPER);
+        sys.add(99, "/usr/bin/other");
+        let (opts, reask) = short();
+        assert!(quit_all_instances(&sys, &CLAUDE, &opts, reask, true).unwrap());
+        assert_eq!(*sys.terminated.borrow(), vec![10, 21]);
+        assert_eq!(sys.processes().unwrap().len(), 1, "only the other app is left");
+    }
+
+    #[test]
+    fn force_terminate_that_does_not_exit_times_out_naming_pids() {
+        /// A machine where SIGTERM does nothing.
+        struct Stubborn(FakeSystem);
+        impl System for Stubborn {
+            fn processes(&self) -> Result<Vec<ProcInfo>> {
+                self.0.processes()
+            }
+            fn env_var(&self, pid: u32, key: &str) -> Result<Option<String>> {
+                self.0.env_var(pid, key)
+            }
+            fn request_quit(&self, target: &AppTarget) -> Result<QuitReply> {
+                self.0.request_quit(target)
+            }
+            fn open(&self, target: &AppTarget) -> Result<()> {
+                self.0.open(target)
+            }
+            fn open_new_with_args(&self, target: &AppTarget, args: &[String]) -> Result<()> {
+                self.0.open_new_with_args(target, args)
+            }
+            fn terminate(&self, pid: u32) -> Result<()> {
+                self.0.terminated.borrow_mut().push(pid);
+                Ok(())
+            }
+        }
+        let mut fake = FakeSystem::new(true);
+        fake.quit_vetoed = true;
+        let sys = Stubborn(fake);
+        sys.0.add(10, CLAUDE_MAIN);
+        sys.0.add(21, CLAUDE_HELPER);
+        let (opts, reask) = short();
+        let err = quit_all_instances(&sys, &CLAUDE, &opts, reask, true).unwrap_err().to_string();
+        assert!(err.contains("Claude did not quit") && err.contains("10, 21"), "{err}");
+        assert!(!sys.0.terminated.borrow().is_empty());
     }
 
     #[test]
