@@ -51,9 +51,32 @@ pub enum Entry {
     Label(String),
     Item { text: String, action: Option<Action>, checked: Option<bool>, enabled: bool },
     Submenu { text: String, entries: Vec<Entry> },
-    /// Level bars for the usage row just above. They are drawn as native bars, and `to_text` omits them
-    /// because that row already shows the same numbers.
+    /// One saved account, as a row that opens its submenu.
+    Account(AccountRow),
+}
+
+/// An account row: `[CLI][APP] name   5h ▬── 10%   wk ▬── 16%   ›`. The native row draws the icons and the
+/// bars; `row_text` is its plain form, for `to_text` and as the title when the drawing cannot be done.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountRow {
+    /// The provider's CLI (Claude CLI, Codex CLI) currently uses this account.
+    pub cli: bool,
+    /// The provider's desktop app (Claude Desktop, ChatGPT) currently uses this account.
+    pub app: bool,
+    /// The saved email, or the label, or the id.
+    pub name: String,
+    pub usage: Usage,
+    /// The submenu: use the account on a surface, or leave a surface unmanaged.
+    pub entries: Vec<Entry>,
+}
+
+/// What an account row shows about its usage.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Usage {
+    /// One bar per window that was read.
     Bars(Vec<Bar>),
+    /// Why there are no bars: `no reading yet`, `login expired`, `sign in again` or `unreadable`.
+    Note(&'static str),
 }
 
 /// How much of a usage window is left, as the color of its bar.
@@ -67,18 +90,18 @@ pub enum Tier {
     Critical,
 }
 
-/// One usage window as a level bar. `used` is the percent shown in the label; the bar shows what is left.
+/// One usage window as a level bar. The fill and the number show `used`; the color shows what is left.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Bar {
-    /// `5h` or `7d`.
+    /// `5h` or `wk` (the weekly window).
     pub window: &'static str,
-    /// The used percent, 0-100, rounded like the menu text.
+    /// The used percent, 0-100.
     pub used: u8,
     pub tier: Tier,
 }
 
 impl Bar {
-    /// The percent left, which is how full the bar is drawn.
+    /// The percent left, which sets the color.
     pub fn remaining(&self) -> u8 {
         100 - self.used
     }
@@ -102,26 +125,47 @@ pub fn tier(remaining: u8, threshold: u8) -> Tier {
 }
 
 /// The bars of a reading: one per window it has. None when there is no reading or it is not a clean one
-/// (expired, dead, unreadable); the text row says why.
+/// (expired, dead, unreadable); `usage` then gives the note instead.
 pub fn usage_bars(rec: Option<&UsageRecord>, now: u64, threshold: u8) -> Vec<Bar> {
     let Some(r) = rec.filter(|r| r.state == UsageState::Ok) else { return Vec::new() };
-    [("5h", &r.windows.five_hour), ("7d", &r.windows.weekly)]
+    [("5h", &r.windows.five_hour), ("wk", &r.windows.weekly)]
         .into_iter()
         .filter_map(|(window, snap)| {
-            // `{:.0}` in `usage_text` rounds ties to even, so the label matches the text row.
+            // Ties round to even, as `{:.0}` would.
             let used = snap.as_ref()?.pct_at(now).round_ties_even().clamp(0.0, 100.0) as u8;
             Some(Bar { window, used, tier: tier(100 - used, threshold) })
         })
         .collect()
 }
 
-/// `entry` followed by a bar row when `bars` is not empty.
-fn with_bars(entry: Entry, bars: Vec<Bar>) -> Vec<Entry> {
-    let mut out = vec![entry];
+/// The usage of an account row: its bars, or the note that says why there are none.
+pub fn usage(rec: Option<&UsageRecord>, now: u64, threshold: u8) -> Usage {
+    let bars = usage_bars(rec, now, threshold);
     if !bars.is_empty() {
-        out.push(Entry::Bars(bars));
+        return Usage::Bars(bars);
     }
-    out
+    Usage::Note(match rec.map(|r| r.state) {
+        None | Some(UsageState::Ok) => "no reading yet",
+        Some(UsageState::Expired) => "login expired",
+        Some(UsageState::Dead) => "sign in again",
+        Some(UsageState::Unreadable) => "unreadable",
+    })
+}
+
+/// `5h 7% · wk 16%`, or the note.
+pub fn usage_text(usage: &Usage) -> String {
+    match usage {
+        Usage::Bars(bars) => bars.iter().map(|b| format!("{} {}%", b.window, b.used)).collect::<Vec<_>>().join(" · "),
+        Usage::Note(note) => (*note).to_string(),
+    }
+}
+
+/// The plain form of an account row: `[CLI][APP] name · 5h 7% · wk 16%`, with blanks for a surface that
+/// uses another account, so the names line up.
+pub fn row_text(row: &AccountRow) -> String {
+    let cli = if row.cli { "[CLI]" } else { "     " };
+    let app = if row.app { "[APP]" } else { "     " };
+    format!("{cli}{app} {} · {}", row.name, usage_text(&row.usage))
 }
 
 impl Entry {
@@ -208,26 +252,6 @@ fn clean_to(text: &str, max: usize) -> String {
     }
 }
 
-/// `5h 32% · 7d 40%`, with a note when the reading is not a clean one.
-pub fn usage_text(rec: Option<&UsageRecord>, now: u64) -> String {
-    let Some(r) = rec else { return "no reading yet".into() };
-    let mut parts = Vec::new();
-    if let Some(w) = &r.windows.five_hour {
-        parts.push(format!("5h {:.0}%", w.pct_at(now)));
-    }
-    if let Some(w) = &r.windows.weekly {
-        parts.push(format!("7d {:.0}%", w.pct_at(now)));
-    }
-    let mut text = if parts.is_empty() { "no reading yet".to_string() } else { parts.join(" · ") };
-    match r.state {
-        UsageState::Ok => {}
-        UsageState::Expired => text.push_str(" (login expired)"),
-        UsageState::Dead => text.push_str(" (sign in again)"),
-        UsageState::Unreadable => text.push_str(" (unreadable)"),
-    }
-    text
-}
-
 fn provider_title(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => "Claude",
@@ -235,39 +259,50 @@ fn provider_title(provider: Provider) -> &'static str {
     }
 }
 
-/// The surface's submenu, followed by the bars of its current account.
-fn surface_entry(config: &Config, state: &State, kind: SurfaceKind, now: u64) -> Vec<Entry> {
-    let threshold = config.auto.threshold;
-    let current = policy::current_account(config, state, kind);
-    let title = match &current {
-        Some(id) => format!("{}: {} · {}", surface_name(kind), label_of(config, id), usage_text(state.usage.get(id), now)),
-        None => format!("{}: unmanaged", surface_name(kind)),
-    };
-    let mut entries: Vec<Entry> = config
-        .accounts
-        .iter()
-        .filter(|a| a.provider == kind.provider())
-        .flat_map(|a| {
-            let rec = state.usage.get(&a.id);
-            let text = format!("{} · {}", account_label(a), usage_text(rec, now));
-            let active = current.as_deref() == Some(a.id.as_str());
-            let row = if kind.is_desktop() {
-                // Clicking an account here quits and reopens the app, so the row says so.
-                let text = if active { text } else { format!("{text}{RELAUNCH_SUFFIX}") };
-                Entry::choice(text, active, Action::SwitchApp(kind, a.id.clone()))
-            } else {
-                Entry::choice(text, active, Action::Bind(kind, Binding::Account(a.id.clone())))
-            };
-            with_bars(row, usage_bars(rec, now, threshold))
-        })
-        .collect();
-    if entries.is_empty() {
-        entries.push(Entry::disabled("No saved accounts"));
+/// The name of an account row: the saved email, else the label, else the id.
+pub fn account_name(account: &Account) -> String {
+    match account.email.as_deref().map(str::trim) {
+        Some(email) if !email.is_empty() => clean(email),
+        _ => account_label(account),
     }
-    entries.push(Entry::Separator);
-    entries.push(Entry::choice("Unmanaged (do not touch)", current.is_none(), Action::Bind(kind, Binding::Unmanaged)));
-    let bars = current.as_deref().map_or_else(Vec::new, |id| usage_bars(state.usage.get(id), now, threshold));
-    with_bars(Entry::Submenu { text: title, entries }, bars)
+}
+
+/// The CLI surface and the desktop surface of `provider`.
+fn surfaces(provider: Provider) -> (SurfaceKind, SurfaceKind) {
+    match provider {
+        Provider::Claude => (SurfaceKind::ClaudeCli, SurfaceKind::ClaudeDesktop),
+        Provider::Openai => (SurfaceKind::CodexCli, SurfaceKind::ChatgptDesktop),
+    }
+}
+
+/// The row of `account`. `cli` and `app` are the provider's surfaces with their current accounts.
+fn account_entry(
+    config: &Config,
+    state: &State,
+    account: &Account,
+    (cli, cli_current): (SurfaceKind, Option<&str>),
+    (app, app_current): (SurfaceKind, Option<&str>),
+    now: u64,
+) -> Entry {
+    let id = account.id.as_str();
+    let (on_cli, on_app) = (cli_current == Some(id), app_current == Some(id));
+    // Clicking it quits and reopens the app, so the row says so unless the app already uses the account.
+    let use_app = format!("Use for {}{}", surface_name(app), if on_app { "" } else { RELAUNCH_SUFFIX });
+    Entry::Account(AccountRow {
+        cli: on_cli,
+        app: on_app,
+        name: account_name(account),
+        usage: usage(state.usage.get(id), now, config.auto.threshold),
+        entries: vec![
+            Entry::choice(format!("Use for {}", surface_name(cli)), on_cli, Action::Bind(cli, Binding::Account(id.to_string()))),
+            Entry::choice(use_app, on_app, Action::SwitchApp(app, id.to_string())),
+        ],
+    })
+}
+
+/// The row that leaves `kind` unmanaged; checked (and inert) when it already is.
+fn unmanaged_entry(kind: SurfaceKind, current: Option<&str>) -> Entry {
+    Entry::choice(format!("Leave {} unmanaged", surface_name(kind)), current.is_none(), Action::Bind(kind, Binding::Unmanaged))
 }
 
 /// The open question for `kind`, as a row that does what the notification button does.
@@ -320,7 +355,7 @@ fn login_entry(login: &LoginStatus) -> Entry {
 fn footer(config: &Config, state: &State, ctx: &Ctx) -> Vec<Entry> {
     let auto = &config.auto;
     let mode = |mode: CodexCliMode, text: &str| Entry::choice(text, auto.codex_cli_mode == mode, Action::SetCodexMode(mode));
-    vec![
+    let settings = vec![
         toggle("Auto-switch", auto.enabled, Action::SetAuto(!auto.enabled)),
         Entry::Submenu {
             text: "Codex CLI auto mode".into(),
@@ -333,8 +368,8 @@ fn footer(config: &Config, state: &State, ctx: &Ctx) -> Vec<Entry> {
         undo_entry(config, state),
         Entry::Separator,
         login_entry(&ctx.login),
-        Entry::item("Quit agent-switch", Action::Quit),
-    ]
+    ];
+    vec![Entry::Submenu { text: "Settings".into(), entries: settings }, Entry::item("Quit agent-switch", Action::Quit)]
 }
 
 /// The whole menu.
@@ -355,19 +390,32 @@ pub fn build(config: &Config, state: &State, ctx: &Ctx) -> Vec<Entry> {
     }
     for provider in [Provider::Claude, Provider::Openai] {
         out.push(Entry::Label(provider_title(provider).into()));
-        for kind in SurfaceKind::ALL.into_iter().filter(|k| k.provider() == provider) {
-            out.extend(surface_entry(config, state, kind, ctx.now));
+        let (cli, app) = surfaces(provider);
+        let cli_current = policy::current_account(config, state, cli);
+        let app_current = policy::current_account(config, state, app);
+        let before = out.len();
+        for account in config.accounts.iter().filter(|a| a.provider == provider) {
+            out.push(account_entry(config, state, account, (cli, cli_current.as_deref()), (app, app_current.as_deref()), ctx.now));
+        }
+        if out.len() == before {
+            out.push(Entry::disabled("No saved accounts"));
+        }
+        // Open questions stay at the top level: they ask for an answer.
+        for kind in [cli, app] {
             out.extend(pending_entry(config, state, kind, ctx.now));
         }
-        match provider {
-            Provider::Claude => {
-                out.push(app_row(config, SurfaceKind::ClaudeDesktop, "Relaunch Claude", Action::RelaunchApp(SurfaceKind::ClaudeDesktop)));
-                out.push(app_row(config, SurfaceKind::ClaudeDesktop, "Open Claude (bound profile)", Action::OpenClaude));
-            }
-            Provider::Openai => {
-                out.push(app_row(config, SurfaceKind::ChatgptDesktop, "Relaunch ChatGPT", Action::RelaunchApp(SurfaceKind::ChatgptDesktop)));
-            }
-        }
+        // Everything else about the provider's surfaces sits in one submenu, so the top level stays the account list.
+        let mut options = match provider {
+            Provider::Claude => vec![
+                app_row(config, SurfaceKind::ClaudeDesktop, "Relaunch Claude", Action::RelaunchApp(SurfaceKind::ClaudeDesktop)),
+                app_row(config, SurfaceKind::ClaudeDesktop, "Open Claude (bound profile)", Action::OpenClaude),
+            ],
+            Provider::Openai => vec![app_row(config, SurfaceKind::ChatgptDesktop, "Relaunch ChatGPT", Action::RelaunchApp(SurfaceKind::ChatgptDesktop))],
+        };
+        options.push(Entry::Separator);
+        options.push(unmanaged_entry(cli, cli_current.as_deref()));
+        options.push(unmanaged_entry(app, app_current.as_deref()));
+        out.push(Entry::Submenu { text: "Options".into(), entries: options });
         out.push(Entry::Separator);
     }
     out.extend(footer(config, state, ctx));
@@ -412,7 +460,10 @@ pub fn to_text(entries: &[Entry]) -> String {
                     out.push_str(&format!("{pad}{text} >\n"));
                     walk(entries, depth + 1, out);
                 }
-                Entry::Bars(_) => {}
+                Entry::Account(row) => {
+                    out.push_str(&format!("{pad}{} >\n", row_text(row)));
+                    walk(&row.entries, depth + 1, out);
+                }
             }
         }
     }
@@ -439,17 +490,13 @@ pub fn render(entries: &[Entry]) -> muda::Result<Rendered> {
     for item in items(entries, &mut actions, &mut counter)? {
         menu.append(item.as_ref())?;
     }
-    // Each `Entry` became exactly one native item, so the bar rows can be found by position.
-    crate::level_bar::attach(menu.ns_menu(), entries);
+    // Each `Entry` became exactly one native item, so the account rows can be found by position.
+    crate::account_row::attach(menu.ns_menu(), entries);
     Ok(Rendered { menu, actions })
 }
 
 fn items(entries: &[Entry], actions: &mut HashMap<MenuId, Action>, counter: &mut usize) -> muda::Result<Vec<Box<dyn IsMenuItem>>> {
     let mut out: Vec<Box<dyn IsMenuItem>> = Vec::new();
-    let next_id = |counter: &mut usize| {
-        *counter += 1;
-        MenuId::new(format!("as-{counter}"))
-    };
     for e in entries {
         match e {
             Entry::Separator => out.push(Box::new(PredefinedMenuItem::separator())),
@@ -465,21 +512,25 @@ fn items(entries: &[Entry], actions: &mut HashMap<MenuId, Action>, counter: &mut
                     None => out.push(Box::new(MenuItem::with_id(id, text, *enabled, None))),
                 }
             }
-            Entry::Submenu { text, entries } => {
-                let sub = Submenu::with_id(next_id(counter), escape_title(text), true);
-                for child in items(entries, actions, counter)? {
-                    sub.append(child.as_ref())?;
-                }
-                out.push(Box::new(sub));
-            }
-            // A text stand-in that `level_bar::attach` turns into bars; it stays as text if that fails.
-            Entry::Bars(bars) => {
-                let text = bars.iter().map(|b| format!("{} {}%", b.window, b.used)).collect::<Vec<_>>().join(" · ");
-                out.push(Box::new(MenuItem::with_id(next_id(counter), text, false, None)));
-            }
+            Entry::Submenu { text, entries } => out.push(submenu(text, entries, actions, counter)?),
+            // `account_row::attach` draws the icons and bars over this plain title; it stays if that fails.
+            Entry::Account(row) => out.push(submenu(&row_text(row), &row.entries, actions, counter)?),
         }
     }
     Ok(out)
+}
+
+fn next_id(counter: &mut usize) -> MenuId {
+    *counter += 1;
+    MenuId::new(format!("as-{counter}"))
+}
+
+fn submenu(text: &str, entries: &[Entry], actions: &mut HashMap<MenuId, Action>, counter: &mut usize) -> muda::Result<Box<dyn IsMenuItem>> {
+    let sub = Submenu::with_id(next_id(counter), escape_title(text), true);
+    for child in items(entries, actions, counter)? {
+        sub.append(child.as_ref())?;
+    }
+    Ok(Box::new(sub))
 }
 
 #[cfg(test)]
@@ -518,15 +569,123 @@ mod tests {
         Ctx { now: NOW, login: LoginStatus::Disabled, watcher_running: true, notice: None, force_offer: None }
     }
 
-    fn find_submenu<'a>(entries: &'a [Entry], prefix: &str) -> &'a Vec<Entry> {
+    fn find_row<'a>(entries: &'a [Entry], name: &str) -> &'a AccountRow {
         entries
             .iter()
             .find_map(|e| match e {
-                Entry::Submenu { text, entries } if text.starts_with(prefix) => Some(entries),
+                Entry::Account(row) if row.name == name => Some(row),
                 _ => None,
             })
-            .unwrap_or_else(|| panic!("no submenu `{prefix}` in\n{}", to_text(entries)))
+            .unwrap_or_else(|| panic!("no account row `{name}` in\n{}", to_text(entries)))
     }
+
+    fn bars(five: (u8, Tier), week: (u8, Tier)) -> Usage {
+        Usage::Bars(vec![Bar { window: "5h", used: five.0, tier: five.1 }, Bar { window: "wk", used: week.0, tier: week.1 }])
+    }
+
+    #[test]
+    fn each_provider_lists_every_account_once_with_icons_for_the_surfaces_that_use_it() {
+        let c = config(); // Claude CLI is bound to Personal, Claude Desktop to Team
+        let mut s = State::default();
+        s.usage.insert("personal".into(), reading(32.0, 40.0));
+        s.usage.insert("team".into(), reading(9.0, 6.0));
+        s.set_active(SurfaceKind::ClaudeCli, Some("team".into())); // auto mode moved it; the binding stays
+        let menu = build(&c, &s, &ctx());
+        let personal = find_row(&menu, "Personal");
+        assert_eq!((personal.cli, personal.app), (false, false));
+        assert_eq!(personal.usage, bars((32, Tier::Plenty), (40, Tier::Plenty)));
+        let team = find_row(&menu, "Team");
+        assert_eq!((team.cli, team.app), (true, true), "the active account, not the binding, gets the icon");
+        // Nothing uses the OpenAI account; it is listed under its own provider.
+        let oa = find_row(&menu, "OpenAI Personal");
+        assert_eq!((oa.cli, oa.app, &oa.usage), (false, false, &Usage::Note("no reading yet")));
+
+        let text = to_text(&menu);
+        assert!(
+            text.starts_with(
+                "Claude\n           Personal · 5h 32% · wk 40% >\n  [ ] Use for Claude CLI\n  [ ] Use for Claude Desktop (relaunches app)\n[CLI][APP] Team · 5h 9% · wk 6% >\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("ChatGPT and Codex\n           OpenAI Personal · no reading yet >\n"), "{text}");
+        assert_eq!(text.matches("Personal ·").count(), 2, "each account once, under its provider: {text}");
+        assert!(!text.contains("Claude CLI:"), "no per-surface submenus: {text}");
+    }
+
+    #[test]
+    fn an_account_submenu_uses_it_on_either_surface_and_unmanaged_rows_sit_in_the_section() {
+        let c = config(); // Claude CLI is bound to Personal, Claude Desktop to Team
+        let menu = build(&c, &State::default(), &ctx());
+        let bind = |kind, id: &str| Action::Bind(kind, Binding::Account(id.into()));
+        let unmanaged = |kind| Entry::choice(format!("Leave {} unmanaged", surface_name(kind)), false, Action::Bind(kind, Binding::Unmanaged));
+        assert_eq!(
+            find_row(&menu, "Personal").entries,
+            vec![
+                Entry::choice("Use for Claude CLI", true, bind(SurfaceKind::ClaudeCli, "personal")),
+                Entry::choice("Use for Claude Desktop (relaunches app)", false, Action::SwitchApp(SurfaceKind::ClaudeDesktop, "personal".into())),
+            ]
+        );
+        let claude_options = options_of(&menu, 0);
+        assert!(claude_options.contains(&unmanaged(SurfaceKind::ClaudeCli)));
+        assert!(claude_options.contains(&unmanaged(SurfaceKind::ClaudeDesktop)));
+        // The app already uses Team: no relaunch suffix, and the checked row does nothing when clicked.
+        let team = &find_row(&menu, "Team").entries;
+        assert_eq!(team[0], Entry::choice("Use for Claude CLI", false, bind(SurfaceKind::ClaudeCli, "team")));
+        assert_eq!(team[1], Entry::Item { text: "Use for Claude Desktop".into(), action: None, checked: Some(true), enabled: true });
+
+        // Both OpenAI surfaces are unmanaged: their rows are checked and do nothing; the names are OpenAI's.
+        let oa = &find_row(&menu, "OpenAI Personal").entries;
+        assert_eq!(oa[0], Entry::choice("Use for Codex CLI", false, bind(SurfaceKind::CodexCli, "oa")));
+        assert_eq!(oa[1], Entry::choice("Use for ChatGPT (relaunches app)", false, Action::SwitchApp(SurfaceKind::ChatgptDesktop, "oa".into())));
+        assert_eq!(oa.len(), 2);
+        let oa_options = options_of(&menu, 1);
+        assert!(oa_options.contains(&Entry::Item { text: "Leave Codex CLI unmanaged".into(), action: None, checked: Some(true), enabled: true }));
+        assert!(oa_options.contains(&Entry::Item { text: "Leave ChatGPT unmanaged".into(), action: None, checked: Some(true), enabled: true }));
+    }
+
+    #[test]
+    fn a_provider_without_accounts_says_so() {
+        let mut c = Config::default();
+        c.add_account(account("p", Provider::Claude, "P")).unwrap();
+        let text = to_text(&build(&c, &State::default(), &ctx()));
+        assert!(text.contains("ChatGPT and Codex\nNo saved accounts (disabled)\n"), "{text}");
+    }
+
+    #[test]
+    fn a_row_is_named_by_its_email_then_its_label_then_its_id() {
+        let mut a = account("id1", Provider::Claude, "Work");
+        assert_eq!(account_name(&a), "Work");
+        a.email = Some("  me@example.com \n".into());
+        assert_eq!(account_name(&a), "me@example.com");
+        a.email = Some("   ".into());
+        assert_eq!(account_name(&a), "Work", "a blank email falls back to the label");
+        a.label = String::new();
+        assert_eq!(account_name(&a), "id1");
+        a.email = Some(format!("{}@example.com", "x".repeat(100)));
+        assert_eq!(account_name(&a).chars().count(), MAX_LABEL_CHARS, "a long email is cut like a label");
+    }
+
+    #[test]
+    fn a_row_without_bars_shows_a_short_note_and_a_new_reading_triggers_a_rebuild() {
+        let mut r = reading(32.0, 40.0);
+        assert_eq!(usage(Some(&r), NOW, 90), bars((32, Tier::Plenty), (40, Tier::Plenty)));
+        assert_eq!(usage_text(&usage(Some(&r), NOW, 90)), "5h 32% · wk 40%");
+        for (state, note) in [(UsageState::Expired, "login expired"), (UsageState::Dead, "sign in again"), (UsageState::Unreadable, "unreadable")] {
+            r.state = state;
+            assert_eq!(usage(Some(&r), NOW, 90), Usage::Note(note), "{state:?}");
+        }
+        assert_eq!(usage(None, NOW, 90), Usage::Note("no reading yet"));
+        assert_eq!(usage(Some(&UsageRecord::default()), NOW, 90), Usage::Note("no reading yet"), "a clean reading with no windows");
+
+        let c = config();
+        let mut s = State::default();
+        s.usage.insert("personal".into(), reading(85.0, 10.0));
+        let menu = build(&c, &s, &ctx());
+        assert!(to_text(&menu).contains("[CLI]      Personal · 5h 85% · wk 10% >"), "{}", to_text(&menu));
+        s.usage.insert("personal".into(), reading(86.0, 10.0));
+        assert!(should_rebuild(&build(&c, &s, &ctx()), &menu, false), "a new reading redraws the row");
+    }
+
 
     #[test]
     fn busy_refusal_offers_switch_anyway() {
@@ -570,33 +729,6 @@ mod tests {
     }
 
     #[test]
-    fn each_surface_row_shows_its_account_with_usage_and_a_check_on_the_active_one() {
-        let c = config();
-        let mut s = State::default();
-        s.usage.insert("personal".into(), reading(32.0, 40.0));
-        s.usage.insert("team".into(), reading(9.0, 6.0));
-        s.set_active(SurfaceKind::ClaudeCli, Some("team".into())); // auto mode moved it; the binding stays
-        let menu = build(&c, &s, &ctx());
-        let text = to_text(&menu);
-        assert!(text.contains("Claude CLI: Team · 5h 9% · 7d 6% >"), "{text}");
-        assert!(text.contains("Claude Desktop: Team · 5h 9% · 7d 6% >"), "{text}");
-        assert!(text.contains("Codex CLI: unmanaged >"), "{text}");
-
-        let cli = find_submenu(&menu, "Claude CLI");
-        assert_eq!(
-            cli[0],
-            Entry::choice("Personal · 5h 32% · 7d 40%", false, Action::Bind(SurfaceKind::ClaudeCli, Binding::parse("personal")))
-        );
-        // Each account with a reading is followed by its bars.
-        let plenty = |window, used| Bar { window, used, tier: Tier::Plenty };
-        assert_eq!(cli[1], Entry::Bars(vec![plenty("5h", 32), plenty("7d", 40)]));
-        // The checked one is the active account and clicking it changes nothing.
-        assert_eq!(cli[2], Entry::Item { text: "Team · 5h 9% · 7d 6%".into(), action: None, checked: Some(true), enabled: true });
-        assert_eq!(cli[3], Entry::Bars(vec![plenty("5h", 9), plenty("7d", 6)]));
-        assert_eq!(cli.last().unwrap(), &Entry::choice("Unmanaged (do not touch)", false, Action::Bind(SurfaceKind::ClaudeCli, Binding::Unmanaged)));
-    }
-
-    #[test]
     fn a_bar_turns_yellow_then_red_as_the_window_runs_out_following_the_auto_threshold() {
         // Default threshold 90: red at 10% left or less, yellow up to 30% left.
         assert_eq!(tier(100, 90), Tier::Plenty);
@@ -620,68 +752,24 @@ mod tests {
         let r = reading(72.0, 95.4);
         assert_eq!(
             usage_bars(Some(&r), NOW, 90),
-            vec![Bar { window: "5h", used: 72, tier: Tier::Low }, Bar { window: "7d", used: 95, tier: Tier::Critical }]
+            vec![Bar { window: "5h", used: 72, tier: Tier::Low }, Bar { window: "wk", used: 95, tier: Tier::Critical }]
         );
         assert_eq!(usage_bars(Some(&r), NOW, 90)[1].remaining(), 5);
         // A reset window is empty again.
         assert_eq!(usage_bars(Some(&r), NOW + 4000, 90)[0], Bar { window: "5h", used: 0, tier: Tier::Plenty });
-        // The label rounds like the text row.
+        // Ties round to even.
         assert_eq!(usage_bars(Some(&reading(32.5, 0.0)), NOW, 90)[0].used, 32);
-        assert_eq!(usage_text(Some(&reading(32.5, 0.0)), NOW), "5h 32% · 7d 0%");
+        assert_eq!(usage_bars(Some(&reading(33.5, 0.0)), NOW, 90)[0].used, 34);
         // Only the windows that were read.
         let mut one = reading(10.0, 20.0);
         one.windows.five_hour = None;
-        assert_eq!(usage_bars(Some(&one), NOW, 90), vec![Bar { window: "7d", used: 20, tier: Tier::Plenty }]);
+        assert_eq!(usage_bars(Some(&one), NOW, 90), vec![Bar { window: "wk", used: 20, tier: Tier::Plenty }]);
         // No reading, or one that is not clean: no bars.
         assert!(usage_bars(None, NOW, 90).is_empty());
         for bad in [UsageState::Expired, UsageState::Dead, UsageState::Unreadable] {
             assert!(usage_bars(Some(&UsageRecord { state: bad, ..reading(10.0, 20.0) }), NOW, 90).is_empty(), "{bad:?}");
         }
         assert!(usage_bars(Some(&UsageRecord::default()), NOW, 90).is_empty());
-    }
-
-    #[test]
-    fn the_surface_row_is_followed_by_its_accounts_bars_which_stay_out_of_the_text_and_trigger_a_rebuild() {
-        let mut c = config();
-        c.auto.threshold = 80;
-        let mut s = State::default();
-        s.usage.insert("personal".into(), reading(85.0, 10.0));
-        s.usage.insert("team".into(), UsageRecord { state: UsageState::Dead, ..reading(9.0, 6.0) });
-        let menu = build(&c, &s, &ctx());
-        let at = |prefix: &str| menu.iter().position(|e| matches!(e, Entry::Submenu { text, .. } if text.starts_with(prefix))).unwrap();
-        // Claude CLI is on Personal: its bars follow, colored by the configured threshold.
-        assert_eq!(
-            menu[at("Claude CLI") + 1],
-            Entry::Bars(vec![Bar { window: "5h", used: 85, tier: Tier::Critical }, Bar { window: "7d", used: 10, tier: Tier::Plenty }])
-        );
-        // Claude Desktop is on Team, whose reading is dead; Codex CLI is unmanaged.
-        assert!(!matches!(menu[at("Claude Desktop") + 1], Entry::Bars(_)));
-        assert!(!matches!(menu[at("Codex CLI") + 1], Entry::Bars(_)));
-        let desktop = find_submenu(&menu, "Claude Desktop");
-        assert!(matches!(desktop[1], Entry::Bars(_)) && !matches!(desktop[3], Entry::Bars(_)), "{desktop:?}");
-
-        assert!(!to_text(&menu).contains("Bars"), "the bars add no text");
-        assert_eq!(to_text(&menu).lines().count(), to_text(&menu.iter().filter(|e| !matches!(e, Entry::Bars(_))).cloned().collect::<Vec<_>>()).lines().count());
-
-        s.usage.insert("personal".into(), reading(86.0, 10.0));
-        assert!(should_rebuild(&build(&c, &s, &ctx()), &menu, false), "a new reading redraws the bars");
-    }
-
-    #[test]
-    fn a_desktop_account_row_says_it_relaunches_and_dispatches_the_combined_action() {
-        let c = config(); // Claude Desktop is bound to Team
-        let menu = build(&c, &State::default(), &ctx());
-        let desktop = find_submenu(&menu, "Claude Desktop");
-        assert_eq!(
-            desktop[0],
-            Entry::choice("Personal · no reading yet (relaunches app)", false, Action::SwitchApp(SurfaceKind::ClaudeDesktop, "personal".into()))
-        );
-        // The active one has no suffix and no action.
-        assert_eq!(desktop[1], Entry::Item { text: "Team · no reading yet".into(), action: None, checked: Some(true), enabled: true });
-        // Unmanaged only unbinds, and CLI rows are unchanged.
-        assert_eq!(desktop.last().unwrap(), &Entry::choice("Unmanaged (do not touch)", false, Action::Bind(SurfaceKind::ClaudeDesktop, Binding::Unmanaged)));
-        let cli = find_submenu(&menu, "Claude CLI");
-        assert!(matches!(&cli[1], Entry::Item { text, action: Some(Action::Bind(SurfaceKind::ClaudeCli, _)), .. } if !text.contains("relaunches")), "{cli:?}");
     }
 
     #[test]
@@ -699,29 +787,6 @@ mod tests {
         assert!(!should_rebuild(&a, &a, false), "a periodic refresh skips an unchanged menu");
         assert!(should_rebuild(&a, &a, true), "a click rebuilds so the native check state matches");
         assert!(should_rebuild(&a, &[], false));
-    }
-
-    #[test]
-    fn an_unmanaged_surface_checks_unmanaged_and_offers_only_accounts_of_its_provider() {
-        let c = config();
-        let menu = build(&c, &State::default(), &ctx());
-        let codex = find_submenu(&menu, "Codex CLI");
-        assert_eq!(codex.len(), 3, "{codex:?}");
-        assert!(matches!(&codex[0], Entry::Item { text, .. } if text.starts_with("OpenAI Personal")));
-        assert!(matches!(codex.last().unwrap(), Entry::Item { checked: Some(true), action: None, .. }));
-    }
-
-    #[test]
-    fn usage_text_marks_a_reading_that_is_not_clean_and_rolls_over_a_reset_window() {
-        let mut r = reading(32.0, 40.0);
-        assert_eq!(usage_text(Some(&r), NOW), "5h 32% · 7d 40%");
-        assert_eq!(usage_text(Some(&r), NOW + 4000), "5h 0% · 7d 40%", "the 5-hour window has reset");
-        r.state = UsageState::Dead;
-        assert_eq!(usage_text(Some(&r), NOW), "5h 32% · 7d 40% (sign in again)");
-        r.state = UsageState::Unreadable;
-        r.windows = Windows::default();
-        assert_eq!(usage_text(Some(&r), NOW), "no reading yet (unreadable)");
-        assert_eq!(usage_text(None, NOW), "no reading yet");
     }
 
     #[test]
@@ -748,6 +813,18 @@ mod tests {
         assert!(actions.contains(&Action::SetLoginItem(false)));
         assert!(actions.contains(&Action::Quit));
         assert!(!actions.contains(&Action::SetCodexMode(CodexCliMode::Notify)), "the current mode is not clickable");
+    }
+
+    /// The "Options" submenu of the `nth` provider section (Claude first).
+    fn options_of(entries: &[Entry], nth: usize) -> &Vec<Entry> {
+        entries
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Submenu { text, entries } if text == "Options" => Some(entries),
+                _ => None,
+            })
+            .nth(nth)
+            .expect("an Options submenu")
     }
 
     fn flatten(entries: &[Entry]) -> Vec<&Entry> {

@@ -5,8 +5,8 @@
 //! (see `worker.rs`) runs the watcher and every action that changes accounts. They talk through
 //! `UserEvent`s and `worker::Cmd`s only.
 
+mod account_row;
 mod icon;
-mod level_bar;
 mod login_item;
 mod menu;
 mod notify;
