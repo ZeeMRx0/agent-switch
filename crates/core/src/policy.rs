@@ -2,15 +2,21 @@
 //! every rule is tested without a network or a Keychain.
 //!
 //! Ported from claude-swap `autoswitch.py` (threshold, hysteresis, cooldown, quarantine, freshen before
-//! activation) and `poll_policy.py` (cadence), simplified to what the plan keeps: one threshold applied to
-//! both windows, candidates in config order, no `best` strategy, no per-account priority.
+//! activation) and `poll_policy.py` (cadence), simplified to one threshold applied to both windows and no
+//! `best` strategy. Accounts are tried in the surface's priority order (`Config::priority`).
 //!
+//! * **Per surface.** A surface whose auto-switch is off (`Auto::enabled_for`) is left alone.
 //! * **Trigger.** The surface's current account has a window at or above `threshold`. A window whose reset
 //!   time has passed counts as 0.
-//! * **Candidates.** Same provider, in config order, not the current account, not dead, not live on another
+//! * **Candidates.** Same provider, in priority order, not the current account, not dead, not live on another
 //!   surface that owns its token, and with both windows below `threshold - hysteresis`. The margin is what
 //!   stops a switch at 91 from flipping back at 88. The caller freshens the candidate and re-checks it just
 //!   before activating.
+//! * **Return.** Below the threshold, with the cooldown over and no event waiting, the surface moves back to
+//!   an account ranked above its current one, if one has a fresh `Ok` reading with headroom, is not dead or
+//!   live elsewhere, and is not the target of another surface's waiting event. The outcome is marked `back`.
+//!   A Codex CLI that shares `~/.codex` with the app never splits off to return. A manual choice makes the
+//!   account the surface's first priority, so a return goes back to what the user picked.
 //! * **Cooldown.** No second automatic switch on a surface within `cooldown_minutes`, unless the current
 //!   account is exhausted (a window at 100).
 //! * **CLI surfaces switch now. Desktop surfaces only raise an event** (`Outcome::Notify`); an app is never
@@ -178,7 +184,10 @@ pub fn confirmed(rec: &UsageRecord, auto: &Auto, now: u64) -> bool {
 pub enum Hold {
     /// The surface is unmanaged or has no account.
     NotManaged,
-    /// The current account is below the threshold on both windows.
+    /// Auto-switch is off for this surface.
+    AutoOff,
+    /// The current account is below the threshold on both windows, and there is no higher-priority account
+    /// to return to now.
     NoTrigger,
     Cooldown,
     /// The current account's reading is stale, so nothing can be decided.
@@ -194,11 +203,13 @@ pub enum Hold {
 pub enum Outcome {
     Hold(Hold),
     /// CLI surface: switch now to the first of `candidates` that passes the final check. `split` is true when
-    /// the Codex CLI shares `~/.codex` with the app and must split off into its own home.
-    Switch { from: String, candidates: Vec<String>, split: bool },
+    /// the Codex CLI shares `~/.codex` with the app and must split off into its own home. `back` is true when
+    /// this returns to a higher-priority account rather than leaving one at its limit.
+    Switch { from: String, candidates: Vec<String>, split: bool, back: bool },
     /// Raise a switch-needed event. `follows_cli` is true for the ChatGPT app sharing `~/.codex` with a CLI
-    /// that switches now: the event then targets the CLI's new account, so the click is the rejoin.
-    Notify { from: String, candidates: Vec<String>, follows_cli: bool },
+    /// that switches now: the event then targets the CLI's new account, so the click is the rejoin. `back`
+    /// is as for `Switch`.
+    Notify { from: String, candidates: Vec<String>, follows_cli: bool, back: bool },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -224,7 +235,7 @@ pub fn codex_shares_home(config: &Config, state: &State) -> bool {
 /// Another surface that owns a token chain of the same provider already shows `cand`: switching `kind` to it
 /// would put two live copies of one login in use. The one exception is the app moving to the account the
 /// split Codex CLI already uses, which is the rejoin.
-fn live_elsewhere(state: &State, kind: SurfaceKind, cand: &str) -> bool {
+pub fn live_elsewhere(state: &State, kind: SurfaceKind, cand: &str) -> bool {
     SurfaceKind::ALL.into_iter().any(|other| {
         other != kind
             && other.provider() == kind.provider()
@@ -234,17 +245,8 @@ fn live_elsewhere(state: &State, kind: SurfaceKind, cand: &str) -> bool {
     })
 }
 
-/// Candidate account ids for `kind`, in config order.
-pub fn candidates(config: &Config, state: &State, kind: SurfaceKind, from: &str, now: u64) -> Vec<String> {
-    let mut out: Vec<String> = config
-        .accounts
-        .iter()
-        .filter(|a| a.provider == kind.provider() && a.id != from)
-        .filter(|a| !live_elsewhere(state, kind, &a.id))
-        .filter(|a| plausible(state.usage.get(&a.id), &config.auto, now))
-        .map(|a| a.id.clone())
-        .collect();
-    // While the CLI is split, the app's event goes to the account the CLI already moved to.
+/// While the Codex CLI is split, the app's event goes to the account the CLI already moved to.
+fn prefer_cli_target(state: &State, kind: SurfaceKind, out: &mut Vec<String>) {
     if kind == SurfaceKind::ChatgptDesktop && state.codex_split() {
         if let Some(target) = state.pending(SurfaceKind::CodexCli).map(|p| p.target_account.clone()) {
             if let Some(i) = out.iter().position(|id| *id == target) {
@@ -253,6 +255,46 @@ pub fn candidates(config: &Config, state: &State, kind: SurfaceKind, from: &str,
             }
         }
     }
+}
+
+/// Candidate account ids for `kind`, in priority order.
+pub fn candidates(config: &Config, state: &State, kind: SurfaceKind, from: &str, now: u64) -> Vec<String> {
+    let mut out: Vec<String> = config
+        .priority(kind)
+        .into_iter()
+        .filter(|id| id != from)
+        .filter(|id| !live_elsewhere(state, kind, id))
+        .filter(|id| plausible(state.usage.get(id), &config.auto, now))
+        .collect();
+    prefer_cli_target(state, kind, &mut out);
+    out
+}
+
+/// Another surface of `kind`'s provider has a waiting switch-needed event that would move it to `cand`.
+fn pending_elsewhere(state: &State, kind: SurfaceKind, cand: &str, now: u64) -> bool {
+    SurfaceKind::ALL.into_iter().any(|other| {
+        other != kind
+            && other.provider() == kind.provider()
+            && state.pending(other).is_some_and(|p| p.reason == REASON_SWITCH_NEEDED && !p.is_expired(now) && p.target_account == cand)
+    })
+}
+
+/// Accounts ranked above `from` in `kind`'s priority that `kind` can return to now: a fresh `Ok` reading
+/// with headroom (so not dead and not stale), not live on another surface that owns its token, and not the
+/// target of another surface's waiting event.
+pub fn return_candidates(config: &Config, state: &State, kind: SurfaceKind, from: &str, now: u64) -> Vec<String> {
+    let mut order = config.priority(kind);
+    let Some(rank) = order.iter().position(|id| id == from) else { return Vec::new() };
+    order.truncate(rank);
+    let mut out: Vec<String> = order
+        .into_iter()
+        .filter(|id| !live_elsewhere(state, kind, id) && !pending_elsewhere(state, kind, id, now))
+        .filter(|id| {
+            let rec = state.usage.get(id);
+            !is_stale(rec, now) && rec.is_some_and(|r| r.state == UsageState::Ok && has_headroom(&r.windows, &config.auto, now))
+        })
+        .collect();
+    prefer_cli_target(state, kind, &mut out);
     out
 }
 
@@ -268,6 +310,10 @@ pub fn decide(config: &Config, state: &State, now: u64) -> Vec<Decision> {
             out.push(hold(Hold::NotManaged, None));
             continue;
         };
+        if !auto.enabled_for(kind) {
+            out.push(hold(Hold::AutoOff, None));
+            continue;
+        }
         let rec = state.usage.get(&from);
         if is_stale(rec, now) {
             out.push(hold(Hold::Stale, None));
@@ -275,50 +321,62 @@ pub fn decide(config: &Config, state: &State, now: u64) -> Vec<Decision> {
         }
         let windows = rec.map(|r| r.windows).unwrap_or_default();
         let pct = windows.worst_at(now);
-        if pct.is_none_or(|p| p < f64::from(auto.threshold)) {
-            out.push(hold(Hold::NoTrigger, pct));
-            continue;
-        }
-        let at_limit = exhausted(&windows, now);
-        if !at_limit && state.last_auto_switch.get(&kind).is_some_and(|t| now.saturating_sub(*t) < cooldown_s) {
-            out.push(hold(Hold::Cooldown, pct));
-            continue;
-        }
+        let cooling = state.last_auto_switch.get(&kind).is_some_and(|t| now.saturating_sub(*t) < cooldown_s);
+        let waiting = state.pending(kind).is_some_and(|p| p.reason == REASON_SWITCH_NEEDED && !p.is_expired(now));
+        let shares = kind == SurfaceKind::CodexCli && codex_shares_home(config, state);
+        // Below the threshold the only move is back up the priority list. A shared Codex CLI does not split
+        // off for it: splitting is only for an account at its limit.
+        let back = pct.is_none_or(|p| p < f64::from(auto.threshold));
+        let returns = if back {
+            let returns = if cooling || waiting || shares { Vec::new() } else { return_candidates(config, state, kind, &from, now) };
+            if returns.is_empty() {
+                out.push(hold(Hold::NoTrigger, pct));
+                continue;
+            }
+            Some(returns)
+        } else {
+            if cooling && !exhausted(&windows, now) {
+                out.push(hold(Hold::Cooldown, pct));
+                continue;
+            }
+            None
+        };
 
         let cli_notifies = kind == SurfaceKind::CodexCli && auto.codex_cli_mode == CodexCliMode::Notify;
-        let shares = kind == SurfaceKind::CodexCli && codex_shares_home(config, state);
         if cli_notifies && shares {
             // The app's event moves both; the CLI needs none of its own.
             out.push(hold(Hold::FollowsDesktop, pct));
             continue;
         }
-        let cands = candidates(config, state, kind, &from, now);
+        let cands = returns.unwrap_or_else(|| candidates(config, state, kind, &from, now));
         if cands.is_empty() {
             out.push(hold(Hold::NoCandidate, pct));
             continue;
         }
         let notify = kind.is_desktop() || cli_notifies;
         if notify {
-            let waiting = state.pending(kind).is_some_and(|p| p.reason == REASON_SWITCH_NEEDED && !p.is_expired(now));
             if waiting {
                 out.push(hold(Hold::EventPending, pct));
                 continue;
             }
-            let follows_cli = kind == SurfaceKind::ChatgptDesktop && codex_shares_home(config, state) && auto.codex_cli_mode != CodexCliMode::Notify;
-            out.push(Decision { surface: kind, outcome: Outcome::Notify { from, candidates: cands, follows_cli }, pct });
+            // On a return the shared CLI does not move first, so the event does not follow it.
+            let follows_cli = !back && kind == SurfaceKind::ChatgptDesktop && codex_shares_home(config, state) && auto.codex_cli_mode != CodexCliMode::Notify;
+            out.push(Decision { surface: kind, outcome: Outcome::Notify { from, candidates: cands, follows_cli, back }, pct });
         } else {
-            out.push(Decision { surface: kind, outcome: Outcome::Switch { from, candidates: cands, split: shares }, pct });
+            out.push(Decision { surface: kind, outcome: Outcome::Switch { from, candidates: cands, split: shares, back }, pct });
         }
     }
     out
 }
 
 /// Providers whose every account has a stale (or no) reading while at least one surface of that provider is
-/// managed: auto mode cannot decide anything for them and pauses.
+/// managed with auto-switch on: auto mode cannot decide anything for them and pauses.
 pub fn paused_providers(config: &Config, state: &State, now: u64) -> Vec<Provider> {
     [Provider::Claude, Provider::Openai]
         .into_iter()
-        .filter(|p| SurfaceKind::ALL.into_iter().any(|k| k.provider() == *p && config.surfaces.get(k).account_id().is_some()))
+        .filter(|p| {
+            SurfaceKind::ALL.into_iter().any(|k| k.provider() == *p && config.surfaces.get(k).account_id().is_some() && config.auto.enabled_for(k))
+        })
         .filter(|p| config.accounts.iter().filter(|a| a.provider == *p).all(|a| is_stale(state.usage.get(&a.id), now)))
         .collect()
 }
@@ -563,6 +621,177 @@ mod tests {
         w.state.set_pending(SurfaceKind::CodexCli, Some(Pending { id: "r".into(), target_account: "z".into(), reason: REASON_REJOIN.into(), from: Some("x".into()), created_at: T0 - 10, expires_at: None }));
         assert_eq!(candidates(&w.config, &w.state, SurfaceKind::ChatgptDesktop, "x", T0), ["z", "y"]);
         assert_eq!(candidates(&w.config, &w.state, SurfaceKind::CodexCli, "z", T0), ["y"], "x is still the app's login and z is the CLI's own: only y is free");
+    }
+
+    #[test]
+    fn candidates_follow_the_priority_of_each_surface() {
+        let mut w = world();
+        w.state.usage.insert("a".into(), rec(91.0, 10.0));
+        w.config.priority.claude_cli = vec!["c".into(), "a".into(), "b".into()];
+        assert_eq!(switch_to(&cli(&w)), ["c", "b"]);
+        // The desktop surface keeps its own order (config order here).
+        w.config.bind(SurfaceKind::ClaudeDesktop, Binding::parse("a")).unwrap();
+        w.state.set_active(SurfaceKind::ClaudeDesktop, Some("a".into()));
+        let d = decide(&w.config, &w.state, T0).into_iter().find(|d| d.surface == SurfaceKind::ClaudeDesktop).unwrap();
+        assert_eq!(switch_to(&d.outcome), ["b", "c"]);
+    }
+
+    #[test]
+    fn a_surface_with_auto_off_gets_no_decision_while_the_others_still_act() {
+        let mut w = world();
+        w.config.bind(SurfaceKind::ClaudeDesktop, Binding::parse("b")).unwrap();
+        w.state.set_active(SurfaceKind::ClaudeDesktop, Some("b".into()));
+        w.state.usage.insert("a".into(), rec(95.0, 10.0));
+        w.state.usage.insert("b".into(), rec(95.0, 10.0));
+        w.config.auto.set_enabled_for(SurfaceKind::ClaudeCli, false);
+        let ds = decide(&w.config, &w.state, T0);
+        assert_eq!(ds.iter().find(|d| d.surface == SurfaceKind::ClaudeCli).unwrap().outcome, Outcome::Hold(Hold::AutoOff));
+        assert!(matches!(ds.iter().find(|d| d.surface == SurfaceKind::ClaudeDesktop).unwrap().outcome, Outcome::Notify { back: false, .. }));
+        // With every account stale, a provider whose surfaces all have auto off is not reported as paused.
+        for id in ["a", "b", "c"] {
+            w.state.usage.get_mut(id).unwrap().fetched_at = Some(T0 - STALE_AFTER_S - 5);
+        }
+        assert_eq!(paused_providers(&w.config, &w.state, T0), vec![Provider::Claude]);
+        w.config.auto.set_enabled_for(SurfaceKind::ClaudeDesktop, false);
+        assert!(paused_providers(&w.config, &w.state, T0).is_empty());
+    }
+
+    /// The Claude CLI on b, below its line, after a switch away from a long enough ago.
+    fn on_b() -> World {
+        let mut w = world();
+        w.state.set_active(SurfaceKind::ClaudeCli, Some("b".into()));
+        w.state.usage.insert("b".into(), rec(40.0, 10.0));
+        w.state.last_auto_switch.insert(SurfaceKind::ClaudeCli, T0 - 300);
+        w
+    }
+
+    #[test]
+    fn a_cli_surface_returns_to_a_higher_priority_account_that_has_room_again() {
+        let w = on_b();
+        assert_eq!(cli(&w), Outcome::Switch { from: "b".into(), candidates: vec!["a".into()], split: false, back: true });
+        // Only accounts ranked above the current one count: c has room but is lower.
+        let mut w = on_b();
+        w.state.usage.insert("a".into(), rec(95.0, 10.0));
+        assert_eq!(cli(&w), Outcome::Hold(Hold::NoTrigger));
+        // A changed priority changes where it returns to.
+        let mut w = on_b();
+        w.config.priority.claude_cli = vec!["c".into(), "a".into(), "b".into()];
+        assert_eq!(switch_to(&cli(&w)), ["c", "a"]);
+        // At the threshold the normal rule applies, not the return.
+        let mut w = on_b();
+        w.state.usage.insert("b".into(), rec(91.0, 10.0));
+        assert!(matches!(cli(&w), Outcome::Switch { back: false, .. }));
+    }
+
+    #[test]
+    fn no_return_during_the_cooldown_or_to_an_account_that_is_stale_unread_dead_or_at_its_line() {
+        let mut w = on_b();
+        w.state.last_auto_switch.insert(SurfaceKind::ClaudeCli, T0 - 299);
+        assert_eq!(cli(&w), Outcome::Hold(Hold::NoTrigger), "cooldown");
+
+        let mut w = on_b();
+        w.state.usage.get_mut("a").unwrap().fetched_at = Some(T0 - STALE_AFTER_S - 1);
+        assert_eq!(cli(&w), Outcome::Hold(Hold::NoTrigger), "stale reading");
+
+        let mut w = on_b();
+        w.state.usage.remove("a");
+        assert_eq!(cli(&w), Outcome::Hold(Hold::NoTrigger), "never read");
+
+        let mut w = on_b();
+        w.state.usage.get_mut("a").unwrap().state = UsageState::Dead;
+        assert_eq!(cli(&w), Outcome::Hold(Hold::NoTrigger), "dead");
+
+        let mut w = on_b();
+        w.state.usage.get_mut("a").unwrap().state = UsageState::Unreadable;
+        assert_eq!(cli(&w), Outcome::Hold(Hold::NoTrigger), "unreadable");
+
+        // Hysteresis: 85 is not below threshold minus hysteresis; 84 is.
+        let mut w = on_b();
+        w.state.usage.insert("a".into(), rec(85.0, 10.0));
+        assert_eq!(cli(&w), Outcome::Hold(Hold::NoTrigger), "at the line");
+        w.state.usage.insert("a".into(), rec(84.0, 10.0));
+        assert!(matches!(cli(&w), Outcome::Switch { back: true, .. }));
+
+        // Auto off for the surface: no return either.
+        let mut w = on_b();
+        w.config.auto.set_enabled_for(SurfaceKind::ClaudeCli, false);
+        assert_eq!(cli(&w), Outcome::Hold(Hold::AutoOff));
+    }
+
+    #[test]
+    fn a_desktop_surface_gets_an_event_to_return_and_not_while_one_waits() {
+        let mut w = world();
+        w.config.bind(SurfaceKind::ClaudeDesktop, Binding::parse("a")).unwrap();
+        w.state.set_active(SurfaceKind::ClaudeDesktop, Some("b".into()));
+        let desktop = |w: &World| decide(&w.config, &w.state, T0).into_iter().find(|d| d.surface == SurfaceKind::ClaudeDesktop).unwrap().outcome;
+        assert_eq!(desktop(&w), Outcome::Hold(Hold::NoTrigger), "a is the Claude CLI's live login");
+        w.state.set_active(SurfaceKind::ClaudeCli, Some("c".into()));
+        assert_eq!(desktop(&w), Outcome::Notify { from: "b".into(), candidates: vec!["a".into()], follows_cli: false, back: true });
+        let ev = Pending { id: "e".into(), target_account: "a".into(), reason: REASON_SWITCH_NEEDED.into(), from: Some("b".into()), created_at: T0 - 100, expires_at: Some(T0 + 800) };
+        w.state.set_pending(SurfaceKind::ClaudeDesktop, Some(ev));
+        assert_eq!(desktop(&w), Outcome::Hold(Hold::NoTrigger));
+    }
+
+    #[test]
+    fn a_return_skips_an_account_live_on_another_token_surface_and_keeps_the_codex_rules() {
+        // The Codex CLI on y; x ranks higher and has room, but the ChatGPT app is logged in to it.
+        let mut w = world();
+        w.config.bind(SurfaceKind::CodexCli, Binding::parse("y")).unwrap();
+        w.config.bind(SurfaceKind::ChatgptDesktop, Binding::parse("x")).unwrap();
+        w.config.priority.codex_cli = vec!["x".into(), "y".into()];
+        w.state.set_active(SurfaceKind::CodexCli, Some("y".into()));
+        w.state.set_active(SurfaceKind::ChatgptDesktop, Some("x".into()));
+        let codex = |w: &World| decide(&w.config, &w.state, T0).into_iter().find(|d| d.surface == SurfaceKind::CodexCli).unwrap().outcome;
+        assert_eq!(codex(&w), Outcome::Hold(Hold::NoTrigger));
+        // With the app on z instead, x is free and the CLI returns with no split.
+        w.config.bind(SurfaceKind::ChatgptDesktop, Binding::parse("z")).unwrap();
+        w.state.set_active(SurfaceKind::ChatgptDesktop, Some("z".into()));
+        assert_eq!(codex(&w), Outcome::Switch { from: "y".into(), candidates: vec!["x".into()], split: false, back: true });
+    }
+
+    #[test]
+    fn a_codex_cli_that_shares_its_home_never_splits_off_to_return() {
+        // Bound together on y, with x ranked higher for both surfaces and room on x.
+        let mut w = world();
+        w.config.bind(SurfaceKind::CodexCli, Binding::parse("y")).unwrap();
+        w.config.bind(SurfaceKind::ChatgptDesktop, Binding::parse("y")).unwrap();
+        w.config.priority.codex_cli = vec!["x".into(), "y".into()];
+        w.config.priority.chatgpt_desktop = vec!["x".into(), "y".into()];
+        w.state.set_active(SurfaceKind::CodexCli, Some("y".into()));
+        w.state.set_active(SurfaceKind::ChatgptDesktop, Some("y".into()));
+        let ds = decide(&w.config, &w.state, T0);
+        let of = |k| ds.iter().find(|d| d.surface == k).unwrap().outcome.clone();
+        assert_eq!(of(SurfaceKind::CodexCli), Outcome::Hold(Hold::NoTrigger), "no split for a return");
+        // The app's event moves both, since they share ~/.codex; it does not follow a CLI that never moved.
+        assert_eq!(of(SurfaceKind::ChatgptDesktop), Outcome::Notify { from: "y".into(), candidates: vec!["x".into()], follows_cli: false, back: true });
+        // At the limit, the split stays the rule.
+        w.state.usage.insert("y".into(), rec(95.0, 10.0));
+        assert!(matches!(decide(&w.config, &w.state, T0).into_iter().find(|d| d.surface == SurfaceKind::CodexCli).unwrap().outcome, Outcome::Switch { split: true, back: false, .. }));
+    }
+
+    #[test]
+    fn a_surface_bound_below_the_first_account_of_an_old_config_does_not_return() {
+        // No [priority] table: the bound account is the first priority, so nothing moves it away.
+        let mut w = world();
+        w.config.bind(SurfaceKind::ClaudeCli, Binding::parse("b")).unwrap();
+        w.state.set_active(SurfaceKind::ClaudeCli, Some("b".into()));
+        assert_eq!(cli(&w), Outcome::Hold(Hold::NoTrigger));
+        // After a switch away from b at its limit, it returns to b first, not to a.
+        w.state.set_active(SurfaceKind::ClaudeCli, Some("c".into()));
+        assert_eq!(switch_to(&cli(&w)), ["b", "a"]);
+    }
+
+    #[test]
+    fn a_return_skips_the_target_of_another_surfaces_waiting_event() {
+        let mut w = on_b();
+        w.config.bind(SurfaceKind::ClaudeDesktop, Binding::parse("c")).unwrap();
+        w.state.set_active(SurfaceKind::ClaudeDesktop, Some("c".into()));
+        let ev = |exp| Pending { id: "e".into(), target_account: "a".into(), reason: REASON_SWITCH_NEEDED.into(), from: Some("c".into()), created_at: T0 - 100, expires_at: Some(exp) };
+        w.state.set_pending(SurfaceKind::ClaudeDesktop, Some(ev(T0 + 800)));
+        assert_eq!(cli(&w), Outcome::Hold(Hold::NoTrigger), "the app may move to a on a click");
+        // Once that event expired, the CLI may return.
+        w.state.set_pending(SurfaceKind::ClaudeDesktop, Some(ev(T0)));
+        assert!(matches!(cli(&w), Outcome::Switch { back: true, .. }));
     }
 
     // ----- cadence -----

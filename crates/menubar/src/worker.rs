@@ -177,7 +177,7 @@ fn run(report: Arc<dyn Fn(Report) + Send + Sync>, rx: mpsc::Receiver<Cmd>, ready
         }
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(Cmd::Do(action)) => {
-                let wakes_watcher = matches!(action, Action::SetAuto(true));
+                let wakes_watcher = matches!(action, Action::SetSurfaceAuto(_, true));
                 let forceable = forceable_kind(&action);
                 let outcome = catch_unwind(AssertUnwindSafe(|| job.handle(action)));
                 match outcome {
@@ -222,6 +222,28 @@ struct Job<'a> {
     watcher: Watcher<'a>,
 }
 
+/// What a pick leaves once the switch is over. The priority follows the binding: a switch that went through
+/// makes `id` the surface's first priority, and so does a failure that leaves the binding on `id` (the app
+/// did not come up signed in, or putting the previous binding back failed). A binding that was put back
+/// leaves the priority alone.
+fn settle_pick(paths: &Paths, kind: SurfaceKind, id: &str, label: &str, switched: Result<Option<String>>) -> Result<Option<String>> {
+    let cause = match switched {
+        Ok(mirrored) => {
+            switch::promote(paths, kind, id)?;
+            return Ok(mirrored);
+        }
+        Err(cause) => cause,
+    };
+    let stays = Config::load(paths).is_ok_and(|c| c.surfaces.get(kind).account_id() == Some(id));
+    let promoted = if stays { switch::promote(paths, kind, id).err().map_or_else(String::new, |e| format!(" {e}")) } else { String::new() };
+    let text = match cause {
+        // A failed switch already says what happened to the binding.
+        Error::Invalid(text) if text.starts_with("Switching ") => text,
+        other => format!("{} is bound to {label}, but switching failed: {other}", surface_name(kind)),
+    };
+    Err(Error::Invalid(format!("{text}{promoted}")))
+}
+
 impl Job<'_> {
     /// Point the app at `id` and restart it. The caller holds the user's consent for the restart.
     /// `force` holds the session titles the user agreed to end (Claude Desktop). When `rollback` is set and
@@ -259,18 +281,14 @@ impl Job<'_> {
         Error::Invalid(format!("Switching {} to {label} failed: {reason}. {outcome}", surface_name(kind)))
     }
 
-    /// Bind `id` and switch the running app to it; a refusal restores the previous binding.
+    /// Bind `id` and switch the running app to it; a refusal restores the previous binding. Only a switch that
+    /// went through makes `id` the surface's first priority, so a rollback has no priority to restore.
     fn switch_to(&self, kind: SurfaceKind, id: &str, force: Option<&str>) -> Result<Option<String>> {
         let paths = self.env.paths;
         let previous = Config::load(paths)?.surfaces.get(kind).clone();
         let config = switch::bind(paths, kind, Binding::Account(id.to_string()))?;
         let label = label_of(&config, id);
-        let mirrored = self.switch_and_restart(&config, kind, id, force, Some(&previous)).map_err(|e| match e {
-            // The binding was already put back; the message says so.
-            Error::Invalid(text) if text.starts_with("Switching ") => Error::Invalid(text),
-            // The app was switched but did not come up signed in: the binding stays.
-            other => Error::Invalid(format!("{} is bound to {label}, but switching failed: {other}", surface_name(kind))),
-        })?;
+        let mirrored = settle_pick(paths, kind, id, &label, self.switch_and_restart(&config, kind, id, force, Some(&previous)))?;
         Ok(Some(on_account(kind, &label, mirrored)))
     }
 
@@ -286,7 +304,8 @@ impl Job<'_> {
         let paths = self.env.paths;
         match action {
             Action::Bind(kind, binding) => {
-                let config = switch::bind(paths, kind, binding.clone())?;
+                // The user's pick: bound and made the first priority, even if the activation below fails.
+                let config = switch::choose(paths, kind, binding.clone())?;
                 let Some(id) = binding.account_id() else {
                     return Ok(Some(format!("{} is unmanaged now; agent-switch will not touch it.", surface_name(kind))));
                 };
@@ -299,11 +318,15 @@ impl Job<'_> {
                     .map_err(|e| Error::Invalid(format!("{} is bound to {label}, but switching failed: {e}", surface_name(kind))))?;
                 Ok(Some(format!("{} now uses {label}.", surface_name(kind))))
             }
-            Action::SetAuto(on) => {
+            Action::SetSurfaceAuto(kind, on) => {
                 Config::update(paths, |config| {
-                    config.auto.enabled = on;
+                    config.auto.set_enabled_for(kind, on);
                     Ok(())
                 })?;
+                Ok(None)
+            }
+            Action::MovePriority { kind, account, up } => {
+                Config::update(paths, |config| config.move_priority(kind, &account, up))?;
                 Ok(None)
             }
             Action::SetCodexMode(mode) => {
@@ -395,14 +418,20 @@ mod tests {
     }
 
     #[test]
-    fn auto_switch_and_codex_mode_are_saved_to_the_config() {
+    fn surface_auto_switch_priority_and_codex_mode_are_saved_to_the_config() {
         let h = home();
         with_job(&h, |job| {
-            job.handle(Action::SetAuto(true)).unwrap();
+            job.handle(Action::SetSurfaceAuto(SurfaceKind::ClaudeCli, true)).unwrap();
+            job.handle(Action::MovePriority { kind: SurfaceKind::ClaudeCli, account: "b".into(), up: true }).unwrap();
             job.handle(Action::SetCodexMode(agent_switch_core::config::CodexCliMode::Notify)).unwrap();
+            // An account that is not in the list (here: the wrong provider's surface) changes nothing.
+            assert!(job.handle(Action::MovePriority { kind: SurfaceKind::CodexCli, account: "a".into(), up: true }).is_err());
         });
         let c = Config::load(&h.paths).unwrap();
-        assert!(c.auto.enabled);
+        assert!(c.auto.enabled_for(SurfaceKind::ClaudeCli));
+        assert!(!c.auto.enabled_for(SurfaceKind::ClaudeDesktop), "the other surfaces keep their value");
+        assert_eq!(c.priority(SurfaceKind::ClaudeCli), ["b", "a"]);
+        assert_eq!(c.priority(SurfaceKind::ClaudeDesktop), ["a", "b"], "each surface has its own order");
         assert_eq!(c.auto.codex_cli_mode, agent_switch_core::config::CodexCliMode::Notify);
     }
 
@@ -417,6 +446,46 @@ mod tests {
         });
         let c = Config::load(&h.paths).unwrap();
         assert_eq!(c.surfaces.claude_desktop, Binding::parse("b"));
+        assert_eq!(c.priority.claude_desktop, ["b", "a"], "a pick is the first priority");
+    }
+
+    #[test]
+    fn picking_a_cli_account_makes_it_the_first_priority_even_if_activation_fails() {
+        let h = home();
+        with_job(&h, |job| {
+            // No saved login in the fake keychain, so the activation fails; the choice stays.
+            assert!(job.handle(Action::Bind(SurfaceKind::ClaudeCli, Binding::parse("b"))).is_err());
+        });
+        let c = Config::load(&h.paths).unwrap();
+        assert_eq!(c.surfaces.claude_cli, Binding::parse("b"));
+        assert_eq!(c.priority.claude_cli, ["b", "a"]);
+    }
+
+    #[test]
+    fn a_desktop_pick_that_switched_but_did_not_come_up_keeps_the_binding_and_is_the_first_priority() {
+        let h = home();
+        switch::bind(&h.paths, SurfaceKind::ClaudeDesktop, Binding::parse("b")).unwrap();
+        let came_up_late = Err(Error::Invalid("Claude did not come up signed in".into()));
+        let said = settle_pick(&h.paths, SurfaceKind::ClaudeDesktop, "b", "B", came_up_late).unwrap_err().to_string();
+        assert!(said.starts_with("Claude Desktop is bound to B, but switching failed"), "{said}");
+        assert_eq!(Config::load(&h.paths).unwrap().priority.claude_desktop, ["b", "a"]);
+
+        // A refused switch put the binding back, so nothing moves up.
+        let refused = Err(Error::Invalid("Switching Claude Desktop to A failed: no saved login. The binding was put back on B.".into()));
+        assert!(settle_pick(&h.paths, SurfaceKind::ClaudeDesktop, "a", "A", refused).is_err());
+        assert_eq!(Config::load(&h.paths).unwrap().priority.claude_desktop, ["b", "a"]);
+    }
+
+    #[test]
+    fn a_desktop_pick_whose_binding_could_not_be_put_back_is_the_first_priority() {
+        let h = home();
+        switch::bind(&h.paths, SurfaceKind::ClaudeDesktop, Binding::parse("b")).unwrap();
+        let stuck = Err(Error::Invalid(
+            "Switching Claude Desktop to B failed: no saved login. The binding stays on B because putting the previous one back failed: locked.".into(),
+        ));
+        let said = settle_pick(&h.paths, SurfaceKind::ClaudeDesktop, "b", "B", stuck).unwrap_err().to_string();
+        assert!(said.starts_with("Switching Claude Desktop to B failed"), "{said}");
+        assert_eq!(Config::load(&h.paths).unwrap().priority.claude_desktop, ["b", "a"]);
     }
 
     #[test]
@@ -479,13 +548,17 @@ mod tests {
             job.handle(Action::Bind(SurfaceKind::ClaudeDesktop, Binding::parse("b"))).unwrap();
             let err = job.handle(Action::SwitchApp(SurfaceKind::ClaudeDesktop, "a".into())).unwrap_err().to_string();
             assert!(err.contains("Switching Claude Desktop to A failed") && err.contains("put back on B"), "{err}");
-            assert_eq!(Config::load(&h.paths).unwrap().surfaces.claude_desktop, Binding::parse("b"));
+            let c = Config::load(&h.paths).unwrap();
+            assert_eq!(c.surfaces.claude_desktop, Binding::parse("b"));
+            assert_eq!(c.priority(SurfaceKind::ClaudeDesktop), ["b", "a"], "a failed pick is not promoted");
         });
         let h = home();
         with_job(&h, |job| {
             let err = job.handle(Action::SwitchApp(SurfaceKind::ClaudeDesktop, "a".into())).unwrap_err().to_string();
             assert!(err.contains("put back on unmanaged"), "{err}");
-            assert_eq!(Config::load(&h.paths).unwrap().surfaces.claude_desktop, Binding::Unmanaged);
+            let c = Config::load(&h.paths).unwrap();
+            assert_eq!(c.surfaces.claude_desktop, Binding::Unmanaged);
+            assert!(c.priority.claude_desktop.is_empty(), "a failed pick writes no priority");
         });
     }
 

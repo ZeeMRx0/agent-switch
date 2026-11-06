@@ -1,4 +1,5 @@
-//! `~/.config/agent-switch/config.toml`: accounts, the binding of each surface, and the `[auto]` settings.
+//! `~/.config/agent-switch/config.toml`: accounts, the binding of each surface, the per-surface account
+//! priority (`[priority]`) and the `[auto]` settings.
 //!
 //! The binding is the user's choice and lives only here. Which account is currently live, and any pending
 //! record, live in `state.json` (see `state.rs`); auto-switch never edits this file.
@@ -191,6 +192,84 @@ impl Surfaces {
     }
 }
 
+/// The order in which auto-switch tries the accounts of each surface, highest first. A surface without a list
+/// puts its bound account first, then config order. Ids that are unknown or belong to the other provider are
+/// ignored, so the file never fails to load because of this table.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default)]
+pub struct Priority {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub claude_cli: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub claude_desktop: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub codex_cli: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub chatgpt_desktop: Vec<String>,
+}
+
+impl Priority {
+    pub fn get(&self, kind: SurfaceKind) -> &[String] {
+        match kind {
+            SurfaceKind::ClaudeCli => &self.claude_cli,
+            SurfaceKind::ClaudeDesktop => &self.claude_desktop,
+            SurfaceKind::CodexCli => &self.codex_cli,
+            SurfaceKind::ChatgptDesktop => &self.chatgpt_desktop,
+        }
+    }
+
+    fn slot(&mut self, kind: SurfaceKind) -> &mut Vec<String> {
+        match kind {
+            SurfaceKind::ClaudeCli => &mut self.claude_cli,
+            SurfaceKind::ClaudeDesktop => &mut self.claude_desktop,
+            SurfaceKind::CodexCli => &mut self.codex_cli,
+            SurfaceKind::ChatgptDesktop => &mut self.chatgpt_desktop,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        SurfaceKind::ALL.into_iter().all(|k| self.get(k).is_empty())
+    }
+}
+
+/// Auto-switch on or off per surface. A surface without a value follows `auto.enabled`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default)]
+pub struct AutoSurfaces {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_cli: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_desktop: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_cli: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chatgpt_desktop: Option<bool>,
+}
+
+impl AutoSurfaces {
+    pub fn get(&self, kind: SurfaceKind) -> Option<bool> {
+        match kind {
+            SurfaceKind::ClaudeCli => self.claude_cli,
+            SurfaceKind::ClaudeDesktop => self.claude_desktop,
+            SurfaceKind::CodexCli => self.codex_cli,
+            SurfaceKind::ChatgptDesktop => self.chatgpt_desktop,
+        }
+    }
+
+    fn slot(&mut self, kind: SurfaceKind) -> &mut Option<bool> {
+        match kind {
+            SurfaceKind::ClaudeCli => &mut self.claude_cli,
+            SurfaceKind::ClaudeDesktop => &mut self.claude_desktop,
+            SurfaceKind::CodexCli => &mut self.codex_cli,
+            SurfaceKind::ChatgptDesktop => &mut self.chatgpt_desktop,
+        }
+    }
+
+    fn is_unset(&self) -> bool {
+        SurfaceKind::ALL.into_iter().all(|k| self.get(k).is_none())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CodexCliMode {
@@ -205,12 +284,38 @@ pub enum CodexCliMode {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Auto {
+    /// Auto-switch for every surface that has no value in `surfaces`.
     pub enabled: bool,
     pub threshold: u8,
     pub hysteresis: u8,
     pub cooldown_minutes: u32,
     pub refresh_inactive: bool,
     pub codex_cli_mode: CodexCliMode,
+    /// `[auto.surfaces]`: auto-switch per surface. Old files have no such table.
+    #[serde(skip_serializing_if = "AutoSurfaces::is_unset")]
+    pub surfaces: AutoSurfaces,
+}
+
+impl Auto {
+    /// Whether auto-switch acts on `kind`.
+    pub fn enabled_for(&self, kind: SurfaceKind) -> bool {
+        self.surfaces.get(kind).unwrap_or(self.enabled)
+    }
+
+    /// Turn auto-switch on or off for `kind` only. Every surface first gets its current value written out,
+    /// so a later change of `enabled` does not silently change the other surfaces.
+    pub fn set_enabled_for(&mut self, kind: SurfaceKind, on: bool) {
+        for k in SurfaceKind::ALL {
+            let current = self.enabled_for(k);
+            *self.surfaces.slot(k) = Some(current);
+        }
+        *self.surfaces.slot(kind) = Some(on);
+    }
+
+    /// Whether auto-switch acts on at least one surface.
+    pub fn any_enabled(&self) -> bool {
+        SurfaceKind::ALL.into_iter().any(|k| self.enabled_for(k))
+    }
 }
 
 impl Default for Auto {
@@ -222,6 +327,7 @@ impl Default for Auto {
             cooldown_minutes: 5,
             refresh_inactive: false,
             codex_cli_mode: CodexCliMode::default(),
+            surfaces: AutoSurfaces::default(),
         }
     }
 }
@@ -231,6 +337,8 @@ impl Default for Auto {
 pub struct Config {
     pub accounts: Vec<Account>,
     pub surfaces: Surfaces,
+    #[serde(skip_serializing_if = "Priority::is_empty")]
+    pub priority: Priority,
     pub auto: Auto,
 }
 
@@ -336,7 +444,63 @@ impl Config {
             return Err(Error::Invalid(format!("account `{id}` is bound to {}; bind them elsewhere first", names.join(", "))));
         }
         let idx = self.accounts.iter().position(|a| a.id == id).ok_or_else(|| Error::NotFound(format!("account `{id}`")))?;
+        for kind in SurfaceKind::ALL {
+            self.priority.slot(kind).retain(|p| p != id);
+        }
         Ok(self.accounts.remove(idx))
+    }
+
+    /// The accounts of `kind`'s provider in auto-switch order, highest first: the saved priority list (known
+    /// ids of the right provider, each once), then every other account of the provider in config order.
+    /// Without a saved list the surface's bound account comes first, so an old config file never makes
+    /// auto-switch move a surface away from the account the user bound it to.
+    pub fn priority(&self, kind: SurfaceKind) -> Vec<String> {
+        let provider = kind.provider();
+        let saved = self.priority.get(kind);
+        let seed: Vec<String> = if saved.is_empty() { self.surfaces.get(kind).account_id().map(str::to_string).into_iter().collect() } else { saved.to_vec() };
+        let mut out: Vec<String> = Vec::new();
+        for id in &seed {
+            if self.account(id).is_some_and(|a| a.provider == provider) && !out.contains(id) {
+                out.push(id.clone());
+            }
+        }
+        for a in self.accounts.iter().filter(|a| a.provider == provider) {
+            if !out.contains(&a.id) {
+                out.push(a.id.clone());
+            }
+        }
+        out
+    }
+
+    /// Make `id` the first account in `kind`'s priority and save the full order. A manual choice of an
+    /// account does this, so auto-switch returns to what the user picked rather than away from it.
+    pub fn promote(&mut self, kind: SurfaceKind, id: &str) -> Result<()> {
+        let mut order = self.priority(kind);
+        let i = self.priority_index(kind, &order, id)?;
+        let first = order.remove(i);
+        order.insert(0, first);
+        *self.priority.slot(kind) = order;
+        Ok(())
+    }
+
+    fn priority_index(&self, kind: SurfaceKind, order: &[String], id: &str) -> Result<usize> {
+        order
+            .iter()
+            .position(|p| p == id)
+            .ok_or_else(|| Error::NotFound(format!("{} account `{id}` for the priority of {kind}", kind.provider())))
+    }
+
+    /// Move `id` one place up (toward the top) or down in `kind`'s priority, and save the full order. An
+    /// account already at that end stays where it is.
+    pub fn move_priority(&mut self, kind: SurfaceKind, id: &str, up: bool) -> Result<()> {
+        let mut order = self.priority(kind);
+        let i = self.priority_index(kind, &order, id)?;
+        let j = if up { i.checked_sub(1) } else { Some(i + 1).filter(|j| *j < order.len()) };
+        if let Some(j) = j {
+            order.swap(i, j);
+            *self.priority.slot(kind) = order;
+        }
+        Ok(())
     }
 }
 
@@ -481,6 +645,142 @@ mod tests {
         c.bind(SurfaceKind::ClaudeCli, Binding::Unmanaged).unwrap();
         assert_eq!(c.remove_account("personal").unwrap().id, "personal");
         assert!(c.remove_account("personal").is_err());
+    }
+
+    fn claude3() -> Config {
+        let mut c = Config::default();
+        for id in ["a", "b", "c"] {
+            c.add_account(acct(id, Provider::Claude)).unwrap();
+        }
+        c.add_account(acct("gpt", Provider::Openai)).unwrap();
+        c
+    }
+
+    #[test]
+    fn priority_is_the_saved_list_then_the_rest_in_config_order() {
+        let mut c = claude3();
+        assert_eq!(c.priority(SurfaceKind::ClaudeCli), ["a", "b", "c"], "no list: config order");
+        assert_eq!(c.priority(SurfaceKind::CodexCli), ["gpt"]);
+        // Unknown ids, ids of the other provider and repeats are ignored; missing accounts go last.
+        c.priority.claude_cli = vec!["c".into(), "ghost".into(), "gpt".into(), "c".into(), "a".into()];
+        assert_eq!(c.priority(SurfaceKind::ClaudeCli), ["c", "a", "b"]);
+        assert_eq!(c.priority(SurfaceKind::ClaudeDesktop), ["a", "b", "c"], "each surface has its own list");
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn moving_an_account_swaps_it_with_its_neighbour_and_stops_at_the_ends() {
+        let mut c = claude3();
+        c.move_priority(SurfaceKind::ClaudeCli, "c", true).unwrap();
+        assert_eq!(c.priority(SurfaceKind::ClaudeCli), ["a", "c", "b"]);
+        assert_eq!(c.priority.claude_cli, ["a", "c", "b"], "the full order is saved");
+        c.move_priority(SurfaceKind::ClaudeCli, "a", false).unwrap();
+        assert_eq!(c.priority(SurfaceKind::ClaudeCli), ["c", "a", "b"]);
+        // At the ends nothing moves.
+        c.move_priority(SurfaceKind::ClaudeCli, "c", true).unwrap();
+        c.move_priority(SurfaceKind::ClaudeCli, "b", false).unwrap();
+        assert_eq!(c.priority(SurfaceKind::ClaudeCli), ["c", "a", "b"]);
+        // Unknown ids and accounts of the other provider are refused.
+        assert!(matches!(c.move_priority(SurfaceKind::ClaudeCli, "ghost", true), Err(Error::NotFound(_))));
+        assert!(c.move_priority(SurfaceKind::ClaudeCli, "gpt", true).is_err());
+        assert!(c.priority.claude_desktop.is_empty(), "other surfaces are untouched");
+    }
+
+    #[test]
+    fn without_a_saved_list_the_bound_account_comes_first() {
+        let mut c = claude3();
+        c.bind(SurfaceKind::ClaudeCli, Binding::parse("b")).unwrap();
+        assert_eq!(c.priority(SurfaceKind::ClaudeCli), ["b", "a", "c"]);
+        assert_eq!(c.priority(SurfaceKind::ClaudeDesktop), ["a", "b", "c"], "an unmanaged surface uses config order");
+        assert!(c.priority.claude_cli.is_empty(), "the default is not written to the file");
+        // A saved list wins over the binding.
+        c.priority.claude_cli = vec!["c".into()];
+        assert_eq!(c.priority(SurfaceKind::ClaudeCli), ["c", "a", "b"]);
+    }
+
+    #[test]
+    fn promoting_an_account_puts_it_first_and_keeps_the_rest_in_order() {
+        let mut c = claude3();
+        c.priority.claude_cli = vec!["b".into(), "c".into(), "a".into()];
+        c.promote(SurfaceKind::ClaudeCli, "a").unwrap();
+        assert_eq!(c.priority.claude_cli, ["a", "b", "c"]);
+        c.promote(SurfaceKind::ClaudeCli, "a").unwrap();
+        assert_eq!(c.priority.claude_cli, ["a", "b", "c"], "already first: no change");
+        c.promote(SurfaceKind::ClaudeDesktop, "c").unwrap();
+        assert_eq!(c.priority.claude_desktop, ["c", "a", "b"]);
+        assert!(c.promote(SurfaceKind::ClaudeCli, "gpt").is_err());
+        assert!(c.promote(SurfaceKind::ClaudeCli, "ghost").is_err());
+    }
+
+    #[test]
+    fn a_new_account_goes_last_and_a_removed_one_leaves_every_list() {
+        let mut c = claude3();
+        c.move_priority(SurfaceKind::ClaudeCli, "b", true).unwrap();
+        c.move_priority(SurfaceKind::ClaudeDesktop, "b", true).unwrap();
+        c.add_account(acct("d", Provider::Claude)).unwrap();
+        assert_eq!(c.priority(SurfaceKind::ClaudeCli), ["b", "a", "c", "d"]);
+        c.remove_account("b").unwrap();
+        assert_eq!(c.priority.claude_cli, ["a", "c"]);
+        assert_eq!(c.priority.claude_desktop, ["a", "c"]);
+        assert_eq!(c.priority(SurfaceKind::ClaudeCli), ["a", "c", "d"]);
+    }
+
+    #[test]
+    fn auto_per_surface_falls_back_to_enabled_until_one_is_set() {
+        let mut auto = Auto::default();
+        assert!(!auto.any_enabled());
+        auto.enabled = true;
+        assert!(SurfaceKind::ALL.into_iter().all(|k| auto.enabled_for(k)), "no table: every surface follows enabled");
+        auto.set_enabled_for(SurfaceKind::ClaudeDesktop, false);
+        assert!(!auto.enabled_for(SurfaceKind::ClaudeDesktop));
+        assert!(auto.enabled_for(SurfaceKind::ClaudeCli) && auto.enabled_for(SurfaceKind::CodexCli) && auto.enabled_for(SurfaceKind::ChatgptDesktop));
+        // The other surfaces were written out, so `enabled` no longer changes them.
+        auto.enabled = false;
+        assert!(auto.enabled_for(SurfaceKind::ClaudeCli));
+        for k in SurfaceKind::ALL {
+            auto.set_enabled_for(k, false);
+        }
+        assert!(!auto.any_enabled());
+    }
+
+    #[test]
+    fn an_old_config_file_loads_with_auto_on_everywhere_and_config_order() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(d.path());
+        std::fs::create_dir_all(paths.config_file().parent().unwrap()).unwrap();
+        let old = "[[accounts]]\nid = \"a\"\nprovider = \"claude\"\n[[accounts]]\nid = \"b\"\nprovider = \"claude\"\n\
+                   [surfaces]\nclaude-cli = \"a\"\n[auto]\nenabled = true\nthreshold = 90\n";
+        std::fs::write(paths.config_file(), old).unwrap();
+        let c = Config::load(&paths).unwrap();
+        assert!(SurfaceKind::ALL.into_iter().all(|k| c.auto.enabled_for(k)));
+        assert_eq!(c.priority(SurfaceKind::ClaudeCli), ["a", "b"]);
+        // Saving it again adds neither table.
+        c.save(&paths).unwrap();
+        let text = std::fs::read_to_string(paths.config_file()).unwrap();
+        assert!(!text.contains("priority") && !text.contains("[auto.surfaces]"), "{text}");
+    }
+
+    #[test]
+    fn priority_and_auto_surfaces_round_trip_through_the_file() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(d.path());
+        let mut c = claude3();
+        c.move_priority(SurfaceKind::ClaudeCli, "c", true).unwrap();
+        c.auto.set_enabled_for(SurfaceKind::CodexCli, true);
+        c.save(&paths).unwrap();
+        assert_eq!(Config::load(&paths).unwrap(), c);
+        let text = std::fs::read_to_string(paths.config_file()).unwrap();
+        assert!(text.contains("[priority]") && text.contains("claude-cli = ["), "{text}");
+        assert!(text.contains("[auto.surfaces]") && text.contains("codex-cli = true") && text.contains("claude-cli = false"), "{text}");
+        // A file with only some surfaces listed, and unknown ids in a list, still loads.
+        std::fs::write(
+            paths.config_file(),
+            "[[accounts]]\nid = \"a\"\nprovider = \"claude\"\n[priority]\nclaude-cli = [\"ghost\", \"a\"]\n[auto]\nenabled = true\n[auto.surfaces]\nclaude-desktop = false\n",
+        )
+        .unwrap();
+        let c = Config::load(&paths).unwrap();
+        assert_eq!(c.priority(SurfaceKind::ClaudeCli), ["a"]);
+        assert!(c.auto.enabled_for(SurfaceKind::ClaudeCli) && !c.auto.enabled_for(SurfaceKind::ClaudeDesktop));
     }
 
     #[test]

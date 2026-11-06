@@ -98,9 +98,14 @@ pub fn switch(surface: &str, account: &str, restart: bool, force: bool) -> Resul
     };
     let env = app.env();
     switch::activate(&env, &config, surf, account)?;
+    // A manual switch is the user's choice: auto-switch should return to it, not away from it. The surface
+    // is on the account once it is activated, so a failed restart does not change that, and a failed
+    // promote must not leave a quit app closed.
+    let promoted = switch::promote(&app.paths, kind, account);
     if restart {
         surf.restart(&env)?;
     }
+    promoted?;
     println!("{kind}: switched to {account}");
     if let Some(d) = &desktop {
         if let Some(line) = d.mirror_summary() {
@@ -180,7 +185,8 @@ pub fn bind(surface: &str, account: &str) -> Result<Code> {
     let kind: SurfaceKind = surface.parse()?;
     let binding = Binding::parse(account);
     let app = App::open()?;
-    let config = switch::bind(&app.paths, kind, binding.clone())?;
+    // Bound and made the first priority of the surface, even if the activation below fails.
+    let config = switch::choose(&app.paths, kind, binding.clone())?;
     let Some(id) = binding.account_id() else {
         println!("{kind}: unmanaged (agent-switch will not touch it)");
         return Ok(0);

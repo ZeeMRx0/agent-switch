@@ -1,5 +1,5 @@
-//! The watcher: one pass (`tick`) polls the accounts that are due, then, with auto mode on, asks the policy
-//! what to do and does it. `run` repeats the pass until told to stop.
+//! The watcher: one pass (`tick`) polls the accounts that are due, then, with auto-switch on for at least one
+//! surface, asks the policy what to do and does it. `run` repeats the pass until told to stop.
 //!
 //! * CLI surfaces switch at once: the candidate is freshened (refreshed when its login expires within ten
 //!   minutes), read again and checked against the headroom rule, and only then activated.
@@ -89,11 +89,14 @@ pub struct Event {
     /// The worst window of `from`, in percent, when the event was caused by a reading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pct: Option<f64>,
+    /// The switch (or switch-needed event) returns the surface to a higher-priority account.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub back: bool,
 }
 
 impl Event {
     fn new(ts: u64, kind: EventKind) -> Event {
-        Event { ts, kind, surface: None, from: None, to: None, id: None, expires_at: None, detail: None, pct: None }
+        Event { ts, kind, surface: None, from: None, to: None, id: None, expires_at: None, detail: None, pct: None, back: false }
     }
     fn pct(mut self, pct: Option<f64>) -> Event {
         self.pct = pct;
@@ -251,12 +254,14 @@ impl<'a> Watcher<'a> {
         let config = Config::load(self.env.paths)?;
         self.poll_due(&config, now);
         self.drop_expired_events(now)?;
-        if !config.auto.enabled {
+        if !config.auto.any_enabled() {
             return Ok(());
         }
         self.update_pause(&config, now)?;
         for kind in SurfaceKind::ALL {
-            // Fresh state for each surface: an earlier switch in this pass changes what is live.
+            // Fresh config and state for each surface: polling takes seconds, and a bind or switch from the
+            // terminal (which also changes the priority) or an earlier switch in this pass may have landed.
+            let config = Config::load(self.env.paths)?;
             let state = State::load(self.env.paths)?;
             let Some(decision) = policy::decide(&config, &state, now).into_iter().find(|d| d.surface == kind) else { continue };
             self.act(&config, decision, now)?;
@@ -317,8 +322,8 @@ impl<'a> Watcher<'a> {
     fn act(&mut self, config: &Config, decision: Decision, now: u64) -> Result<()> {
         let kind = decision.surface;
         match decision.outcome {
-            Outcome::Switch { from, candidates, split } => self.switch_now(config, kind, &from, &candidates, split, decision.pct, now),
-            Outcome::Notify { from, candidates, follows_cli } => self.raise_event(config, kind, &from, &candidates, follows_cli, decision.pct, now),
+            Outcome::Switch { from, candidates, split, back } => self.switch_now(config, kind, &from, &candidates, split, back, decision.pct, now),
+            Outcome::Notify { from, candidates, follows_cli, back } => self.raise_event(config, kind, &from, &candidates, follows_cli, back, decision.pct, now),
             Outcome::Hold(Hold::NoCandidate) => {
                 if self.last_no_candidate.iter().any(|(k, t)| *k == kind && now.saturating_sub(*t) < NO_CANDIDATE_REPEAT_S) {
                     return Ok(());
@@ -386,7 +391,7 @@ impl<'a> Watcher<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn switch_now(&mut self, config: &Config, kind: SurfaceKind, from: &str, candidates: &[String], split: bool, pct: Option<f64>, now: u64) -> Result<()> {
+    fn switch_now(&mut self, config: &Config, kind: SurfaceKind, from: &str, candidates: &[String], split: bool, back: bool, pct: Option<f64>, now: u64) -> Result<()> {
         let live = self.live_key(kind);
         // A changed live login clears what was remembered about this surface.
         self.failures.retain(|f| f.kind != kind || f.live == live);
@@ -416,6 +421,7 @@ impl<'a> Watcher<'a> {
                         s.last_auto_switch.insert(kind, now);
                     })?;
                     let mut detail = match pct {
+                        _ if back => return_detail(id),
                         Some(p) => format!("{from} was at {p:.0}%"),
                         None => format!("{from} was at its limit"),
                     };
@@ -428,7 +434,9 @@ impl<'a> Watcher<'a> {
                     if split {
                         detail.push_str("; the Codex CLI uses its own home until the ChatGPT app moves to the same account");
                     }
-                    self.emit(Event::new(now, EventKind::Switched).surface(kind).from(from).to(id).detail(detail).pct(pct));
+                    let mut event = Event::new(now, EventKind::Switched).surface(kind).from(from).to(id).detail(detail).pct(pct);
+                    event.back = back;
+                    self.emit(event);
                     return Ok(());
                 }
                 Err(e) => {
@@ -447,13 +455,13 @@ impl<'a> Watcher<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn raise_event(&mut self, config: &Config, kind: SurfaceKind, from: &str, candidates: &[String], follows_cli: bool, pct: Option<f64>, now: u64) -> Result<()> {
+    fn raise_event(&mut self, config: &Config, kind: SurfaceKind, from: &str, candidates: &[String], follows_cli: bool, back: bool, pct: Option<f64>, now: u64) -> Result<()> {
         let Some(target) = candidates.first() else { return Ok(()) };
         let id = format!("{now:x}-{}-{target}", kind.name());
         let expires_at = now + EVENT_TTL_S;
         let record = Pending { id: id.clone(), target_account: target.clone(), reason: REASON_SWITCH_NEEDED.into(), from: Some(from.to_string()), created_at: now, expires_at: Some(expires_at) };
         State::update(self.env.paths, |s| s.set_pending(kind, Some(record)))?;
-        let mut detail = format!("{from} is near its limit");
+        let mut detail = if back { return_detail(target) } else { format!("{from} is near its limit") };
         if follows_cli {
             detail.push_str("; relaunching the app also brings the Codex CLI back to the shared home");
         }
@@ -463,6 +471,7 @@ impl<'a> Watcher<'a> {
         let mut event = Event::new(now, EventKind::SwitchNeeded).surface(kind).from(from).to(target).detail(detail).pct(pct);
         event.id = Some(id);
         event.expires_at = Some(expires_at);
+        event.back = back;
         self.emit(event);
         Ok(())
     }
@@ -471,7 +480,8 @@ impl<'a> Watcher<'a> {
     ///
     /// A stale event changes nothing: it must still be the pending one, within its lifetime, the surface must
     /// still be on the account it was raised for, and the target must still exist, belong to the surface's
-    /// provider and not be dead. The target is freshened and read again; an unreadable usage endpoint does not
+    /// provider, not be dead and not be live on another surface that owns its token (another switch may have
+    /// moved there since the event was raised). The target is freshened and read again; an unreadable usage endpoint does not
     /// block the switch the user asked for, but a target that is now full does.
     pub fn relaunch(&mut self, kind: SurfaceKind, event_id: &str, now: u64) -> Result<Relaunch> {
         let config = Config::load(self.env.paths)?;
@@ -505,6 +515,9 @@ impl<'a> Watcher<'a> {
         if state.usage.get(&target.id).is_some_and(|r| r.state == UsageState::Dead) {
             return stale(self, "the target account needs a new sign-in", true);
         }
+        if policy::live_elsewhere(&state, kind, &target.id) {
+            return stale(self, "the target account is now in use on another surface", true);
+        }
         match token_refresh::freshen(&self.refresh_ctx(), target, now, FRESHEN_WITHIN_S) {
             Ok(_) => {}
             Err(FreshenError::Dead(_)) => return stale(self, "the target account needs a new sign-in", true),
@@ -516,6 +529,8 @@ impl<'a> Watcher<'a> {
             }
         }
 
+        // The app writes the shared `~/.codex`, so a Codex CLI that shares it moves along.
+        let moves_cli = kind == SurfaceKind::ChatgptDesktop && policy::codex_shares_home(&config, &state);
         let surface = (self.surfaces)(kind);
         // The event was raised for a running app; a quit app has nothing to relaunch.
         if surface.is_running(self.env).ok().flatten() == Some(false) {
@@ -528,6 +543,10 @@ impl<'a> Watcher<'a> {
             if s.pending(kind).is_some_and(|q| q.id == event_id) {
                 s.set_pending(kind, None);
             }
+            // Only the app's switch is undoable: undoing the CLI alone would not change the shared files.
+            if moves_cli {
+                s.set_active(SurfaceKind::CodexCli, Some(target.id.clone()));
+            }
         })?;
         let from = p.from.clone().unwrap_or_default();
         self.emit(Event::new(now, EventKind::Switched).surface(kind).from(&from).to(&target.id).detail("relaunched after a click"));
@@ -536,6 +555,11 @@ impl<'a> Watcher<'a> {
         }
         Ok(Relaunch::Done { from, to: target.id.clone() })
     }
+}
+
+/// The event detail of a move back up the priority list.
+fn return_detail(to: &str) -> String {
+    format!("returning to higher-priority account; {to} has room again")
 }
 
 #[cfg(test)]
@@ -557,6 +581,8 @@ mod tests {
         fail: bool,
         running: Option<bool>,
         who: Option<String>,
+        /// Saved once, on the first successful apply: a change made from the terminal during the pass.
+        rewrite: Arc<Mutex<Option<Config>>>,
     }
 
     impl Surface for Rec {
@@ -576,6 +602,9 @@ mod tests {
             }
             let split = State::load(&self.paths).unwrap().codex_split();
             self.calls.lock().unwrap().push(format!("apply:{}:{}{}", self.kind.name(), s.account_id, if split { ":split" } else { "" }));
+            if let Some(config) = self.rewrite.lock().unwrap().take() {
+                config.save(&self.paths).unwrap();
+            }
             Ok(())
         }
         fn is_running(&self, _: &Env) -> Result<Option<bool>> {
@@ -593,16 +622,25 @@ mod tests {
         fail: Arc<Mutex<bool>>,
         running: Arc<Mutex<Option<bool>>>,
         who: Arc<Mutex<Option<String>>>,
+        rewrite: Arc<Mutex<Option<Config>>>,
     }
 
     impl Rig {
         fn new(accounts: &[(&str, Provider, i64)]) -> Rig {
-            Rig { f: Fixture::new(accounts), calls: Arc::default(), fail: Arc::default(), running: Arc::default(), who: Arc::default() }
+            Rig { f: Fixture::new(accounts), calls: Arc::default(), fail: Arc::default(), running: Arc::default(), who: Arc::default(), rewrite: Arc::default() }
         }
         fn run<T>(&self, body: impl FnOnce(&mut Watcher) -> T) -> T {
             let env = self.f.env();
             let factory = |k: SurfaceKind| -> Box<dyn Surface> {
-                Box::new(Rec { kind: k, calls: self.calls.clone(), paths: self.f.paths.clone(), fail: *self.fail.lock().unwrap(), running: *self.running.lock().unwrap(), who: self.who.lock().unwrap().clone() })
+                Box::new(Rec {
+                    kind: k,
+                    calls: self.calls.clone(),
+                    paths: self.f.paths.clone(),
+                    fail: *self.fail.lock().unwrap(),
+                    running: *self.running.lock().unwrap(),
+                    who: self.who.lock().unwrap().clone(),
+                    rewrite: self.rewrite.clone(),
+                })
             };
             let mut w = Watcher::new(&env, &self.f.api, &factory);
             body(&mut w)
@@ -666,6 +704,61 @@ mod tests {
         r.run(|w| w.tick(T0).unwrap());
         assert!(r.applies().is_empty());
         assert_eq!(State::load(&r.f.paths).unwrap().usage["a"].windows.worst_at(T0), Some(99.0));
+    }
+
+    #[test]
+    fn the_cli_returns_to_a_higher_priority_account_after_the_cooldown() {
+        let r = claude3();
+        r.f.set_active(SurfaceKind::ClaudeCli, "b");
+        State::update(&r.f.paths, |s| {
+            s.last_auto_switch.insert(SurfaceKind::ClaudeCli, T0 - 100);
+        })
+        .unwrap();
+        r.f.api.script_usage("a", vec![ok(10.0, 10.0)]);
+        r.f.api.script_usage("b", vec![ok(40.0, 10.0)]);
+        r.f.api.script_usage("c", vec![ok(10.0, 10.0)]);
+        r.run(|w| {
+            w.tick(T0).unwrap();
+            assert!(r.applies().is_empty(), "still in the cooldown");
+            w.tick(T0 + 200).unwrap();
+        });
+        assert_eq!(r.applies(), ["apply:claude-cli:a"]);
+        let e = r.events().pop().unwrap();
+        assert_eq!((e.kind, e.from.as_deref(), e.to.as_deref()), (EventKind::Switched, Some("b"), Some("a")));
+        assert_eq!(e.detail.as_deref(), Some("returning to higher-priority account; a has room again"));
+        assert!(e.back);
+        assert!(!r.events().iter().any(|e| e.kind != EventKind::Switched || !e.back), "only the return is logged");
+    }
+
+    #[test]
+    fn a_desktop_surface_gets_an_event_to_return_to_a_higher_priority_account() {
+        let mut r = Rig::new(&[("a", Provider::Claude, OK), ("b", Provider::Claude, OK)]);
+        r.auto(|c| c.auto.enabled = true);
+        r.f.bind(SurfaceKind::ClaudeDesktop, "a");
+        r.f.set_active(SurfaceKind::ClaudeDesktop, "b");
+        r.f.api.script_usage("a", vec![ok(10.0, 10.0)]);
+        r.f.api.script_usage("b", vec![ok(40.0, 10.0)]);
+        r.run(|w| w.tick(T0).unwrap());
+        assert!(r.applies().is_empty() && r.calls.lock().unwrap().is_empty(), "nothing quits without a click");
+        let e = r.events().pop().unwrap();
+        assert_eq!((e.kind, e.from.as_deref(), e.to.as_deref()), (EventKind::SwitchNeeded, Some("b"), Some("a")));
+        assert!(e.back);
+        assert!(e.detail.unwrap().starts_with("returning to higher-priority account; a has room again"));
+    }
+
+    #[test]
+    fn auto_off_for_one_surface_leaves_it_alone_while_another_still_acts() {
+        let mut r = claude3();
+        r.f.bind(SurfaceKind::ClaudeDesktop, "b");
+        r.f.set_active(SurfaceKind::ClaudeDesktop, "b");
+        r.auto(|c| c.auto.set_enabled_for(SurfaceKind::ClaudeCli, false));
+        r.f.api.script_usage("a", vec![ok(95.0, 10.0)]);
+        r.f.api.script_usage("b", vec![ok(95.0, 10.0)]);
+        r.f.api.script_usage("c", vec![ok(10.0, 10.0)]);
+        r.run(|w| w.tick(T0).unwrap());
+        assert!(r.applies().is_empty(), "the Claude CLI stays on a");
+        assert_eq!(r.kinds(), [EventKind::SwitchNeeded]);
+        assert_eq!(r.events()[0].surface.as_deref(), Some("claude-desktop"));
     }
 
     #[test]
@@ -906,7 +999,43 @@ mod tests {
         });
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
+        assert!(!seen[0].back, "leaving an account at its limit is not a return");
         assert_eq!((seen[0].kind, seen[0].from.as_deref(), seen[0].to.as_deref(), seen[0].pct), (EventKind::Switched, Some("a"), Some("b"), Some(91.0)));
+    }
+
+    #[test]
+    fn a_click_is_stale_when_the_target_is_now_live_on_another_token_surface() {
+        let r = claude_desktop_rig();
+        r.run(|w| {
+            w.tick(T0).unwrap();
+            let id = State::load(w.env.paths).unwrap().pending(SurfaceKind::ClaudeDesktop).unwrap().id.clone();
+            // While the event waited, the Claude CLI moved to its target.
+            State::update(w.env.paths, |s| s.set_active(SurfaceKind::ClaudeCli, Some("b".into()))).unwrap();
+            assert!(matches!(w.relaunch(SurfaceKind::ClaudeDesktop, &id, T0 + 10).unwrap(), Relaunch::Stale(m) if m.contains("in use on another surface")));
+            assert!(State::load(w.env.paths).unwrap().pending(SurfaceKind::ClaudeDesktop).is_none(), "the stale event is dropped");
+        });
+        assert!(r.applies().is_empty() && r.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_old_config_file_with_a_surface_bound_below_the_first_account_switches_nothing() {
+        let r = Rig::new(&[("a", Provider::Claude, OK), ("b", Provider::Claude, OK)]);
+        std::fs::write(
+            r.f.paths.config_file(),
+            "[[accounts]]\nid = \"a\"\nprovider = \"claude\"\n[[accounts]]\nid = \"b\"\nprovider = \"claude\"\n\
+             [surfaces]\nclaude-cli = \"b\"\nclaude-desktop = \"b\"\n[auto]\nenabled = true\n",
+        )
+        .unwrap();
+        r.f.set_active(SurfaceKind::ClaudeCli, "b");
+        r.f.set_active(SurfaceKind::ClaudeDesktop, "b");
+        r.f.api.script_usage("a", vec![ok(5.0, 5.0)]);
+        r.f.api.script_usage("b", vec![ok(40.0, 10.0)]);
+        r.run(|w| {
+            w.tick(T0).unwrap();
+            w.tick(T0 + 400).unwrap();
+        });
+        assert!(r.applies().is_empty());
+        assert!(r.kinds().is_empty(), "no switch and no event: {:?}", r.kinds());
     }
 
     #[test]
@@ -994,6 +1123,53 @@ mod tests {
     }
 
     #[test]
+    fn a_click_that_moves_a_shared_chatgpt_app_records_the_codex_cli_on_the_new_account_too() {
+        // Bound together on y, with x ranked higher for both: the CLI stays (no split for a return) and the
+        // app gets the return event. The click rewrites the shared ~/.codex, so the CLI is on x as well.
+        let mut r = Rig::new(&[("x", Provider::Openai, OK), ("y", Provider::Openai, OK)]);
+        r.f.bind(SurfaceKind::CodexCli, "y");
+        r.f.bind(SurfaceKind::ChatgptDesktop, "y");
+        r.f.set_active(SurfaceKind::CodexCli, "y");
+        r.f.set_active(SurfaceKind::ChatgptDesktop, "y");
+        r.auto(|c| {
+            c.auto.enabled = true;
+            c.priority.codex_cli = vec!["x".into(), "y".into()];
+            c.priority.chatgpt_desktop = vec!["x".into(), "y".into()];
+        });
+        r.f.api.script_usage("x", vec![ok(5.0, 5.0)]);
+        r.f.api.script_usage("y", vec![ok(40.0, 10.0)]);
+        r.run(|w| {
+            w.tick(T0).unwrap();
+            assert!(r.applies().is_empty(), "the CLI does not split to return");
+            let ev = State::load(w.env.paths).unwrap().pending(SurfaceKind::ChatgptDesktop).unwrap().clone();
+            assert_eq!(w.relaunch(SurfaceKind::ChatgptDesktop, &ev.id, T0 + 30).unwrap(), Relaunch::Done { from: "y".into(), to: "x".into() });
+        });
+        let st = State::load(&r.f.paths).unwrap();
+        assert_eq!((st.active(SurfaceKind::ChatgptDesktop), st.active(SurfaceKind::CodexCli)), (Some("x"), Some("x")));
+        assert_eq!(st.undo_target(None).unwrap().surface, SurfaceKind::ChatgptDesktop, "Undo moves the app, which takes the CLI along");
+        assert!(st.undo_target(Some(SurfaceKind::CodexCli)).is_none());
+        assert!(!st.codex_split());
+    }
+
+    #[test]
+    fn a_config_change_during_a_pass_is_used_for_the_surfaces_decided_after_it() {
+        // The Claude CLI switches first; meanwhile Claude Desktop's auto-switch is turned off from outside.
+        let mut r = claude3();
+        r.f.bind(SurfaceKind::ClaudeDesktop, "b");
+        r.f.set_active(SurfaceKind::ClaudeDesktop, "b");
+        r.f.api.script_usage("a", vec![ok(95.0, 10.0)]);
+        r.f.api.script_usage("b", vec![ok(95.0, 10.0)]);
+        r.f.api.script_usage("c", vec![ok(10.0, 10.0)]);
+        let mut changed = r.f.config.clone();
+        changed.auto.set_enabled_for(SurfaceKind::ClaudeDesktop, false);
+        *r.rewrite.lock().unwrap() = Some(changed);
+        r.run(|w| w.tick(T0).unwrap());
+        assert_eq!(r.applies(), ["apply:claude-cli:c"]);
+        // With the config read before the switch, Claude Desktop would still be decided and report no candidate.
+        assert_eq!(r.kinds(), [EventKind::Switched]);
+    }
+
+    #[test]
     fn a_failed_split_leaves_no_rejoin_record() {
         let r = openai_rig(CodexCliMode::NewSessions, true);
         *r.fail.lock().unwrap() = true;
@@ -1053,7 +1229,7 @@ mod tests {
     fn only_one_watcher_can_start() {
         let r = claude3();
         let env = r.f.env();
-        let factory = |k: SurfaceKind| -> Box<dyn Surface> { Box::new(Rec { kind: k, calls: Arc::default(), paths: r.f.paths.clone(), fail: false, running: None, who: None }) };
+        let factory = |k: SurfaceKind| -> Box<dyn Surface> { Box::new(Rec { kind: k, calls: Arc::default(), paths: r.f.paths.clone(), fail: false, running: None, who: None, rewrite: Arc::default() }) };
         let first = Watcher::start(&env, &r.f.api, &factory).unwrap();
         assert!(matches!(Watcher::start(&env, &r.f.api, &factory), Err(Error::LockBusy(_))));
         drop(first);

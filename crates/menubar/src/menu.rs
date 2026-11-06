@@ -24,7 +24,10 @@ const RELAUNCH_SUFFIX: &str = " (relaunches app)";
 pub enum Action {
     /// Choose the account of a surface, or `unmanaged`.
     Bind(SurfaceKind, Binding),
-    SetAuto(bool),
+    /// Turn auto-switch on or off for one surface.
+    SetSurfaceAuto(SurfaceKind, bool),
+    /// Move `account` one place up or down in the auto-switch priority of `kind`.
+    MovePriority { kind: SurfaceKind, account: String, up: bool },
     SetCodexMode(CodexCliMode),
     /// Quit the app, switch it to its bound account and open it again.
     RelaunchApp(SurfaceKind),
@@ -51,12 +54,13 @@ pub enum Entry {
     Label(String),
     Item { text: String, action: Option<Action>, checked: Option<bool>, enabled: bool },
     Submenu { text: String, entries: Vec<Entry> },
-    /// One saved account, as a row that opens its submenu.
+    /// One saved account, as a plain row that shows which surfaces use it and its usage.
     Account(AccountRow),
 }
 
-/// An account row: `[CLI][APP] name   5h ▬── 10%   wk ▬── 16%   ›`. The native row draws the icons and the
-/// bars; `row_text` is its plain form, for `to_text` and as the title when the drawing cannot be done.
+/// An account row: `[CLI][APP] name   5h ▬── 10%   wk ▬── 16%`. The native row draws the icons and the bars;
+/// `row_text` is its plain form, for `to_text` and as the title when the drawing cannot be done. The row has
+/// no submenu and no action; the account is chosen in the `CLI` and `Desktop` submenus.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountRow {
     /// The provider's CLI (Claude CLI, Codex CLI) currently uses this account.
@@ -66,8 +70,6 @@ pub struct AccountRow {
     /// The saved email, or the label, or the id.
     pub name: String,
     pub usage: Usage,
-    /// The submenu: use the account on a surface, or leave a surface unmanaged.
-    pub entries: Vec<Entry>,
 }
 
 /// What an account row shows about its usage.
@@ -275,34 +277,80 @@ fn surfaces(provider: Provider) -> (SurfaceKind, SurfaceKind) {
     }
 }
 
-/// The row of `account`. `cli` and `app` are the provider's surfaces with their current accounts.
-fn account_entry(
-    config: &Config,
-    state: &State,
-    account: &Account,
-    (cli, cli_current): (SurfaceKind, Option<&str>),
-    (app, app_current): (SurfaceKind, Option<&str>),
-    now: u64,
-) -> Entry {
+/// The row of `account`. `cli_current` and `app_current` are the current accounts of the provider's surfaces.
+fn account_entry(state: &State, account: &Account, cli_current: Option<&str>, app_current: Option<&str>, threshold: u8, now: u64) -> Entry {
     let id = account.id.as_str();
-    let (on_cli, on_app) = (cli_current == Some(id), app_current == Some(id));
-    // Clicking it quits and reopens the app, so the row says so unless the app already uses the account.
-    let use_app = format!("Use for {}{}", surface_name(app), if on_app { "" } else { RELAUNCH_SUFFIX });
     Entry::Account(AccountRow {
-        cli: on_cli,
-        app: on_app,
+        cli: cli_current == Some(id),
+        app: app_current == Some(id),
         name: account_name(account),
-        usage: usage(state.usage.get(id), now, config.auto.threshold),
-        entries: vec![
-            Entry::choice(format!("Use for {}", surface_name(cli)), on_cli, Action::Bind(cli, Binding::Account(id.to_string()))),
-            Entry::choice(use_app, on_app, Action::SwitchApp(app, id.to_string())),
-        ],
+        usage: usage(state.usage.get(id), now, threshold),
     })
 }
 
-/// The row that leaves `kind` unmanaged; checked (and inert) when it already is.
-fn unmanaged_entry(kind: SurfaceKind, current: Option<&str>) -> Entry {
-    Entry::choice(format!("Leave {} unmanaged", surface_name(kind)), current.is_none(), Action::Bind(kind, Binding::Unmanaged))
+/// The name of account `id` as the rows show it, or the id itself when the account is gone.
+fn name_of(config: &Config, id: &str) -> String {
+    config.account(id).map_or_else(|| clean(id), account_name)
+}
+
+/// The submenu of one surface: `CLI: name` or `Desktop: name`. It picks the account (or none), turns
+/// auto-switch on or off and orders the accounts for auto-switch.
+fn surface_entry(config: &Config, kind: SurfaceKind, current: Option<&str>) -> Entry {
+    let mut entries = Vec::new();
+    for account in config.accounts.iter().filter(|a| a.provider == kind.provider()) {
+        let id = account.id.as_str();
+        let on = current == Some(id);
+        let name = account_name(account);
+        entries.push(if kind.is_desktop() {
+            // Clicking it quits and reopens the app, so the row says so unless the app already uses the account.
+            Entry::choice(format!("{name}{}", if on { "" } else { RELAUNCH_SUFFIX }), on, Action::SwitchApp(kind, id.to_string()))
+        } else {
+            Entry::choice(name, on, Action::Bind(kind, Binding::Account(id.to_string())))
+        });
+    }
+    entries.push(Entry::choice("Leave unmanaged", current.is_none(), Action::Bind(kind, Binding::Unmanaged)));
+    entries.push(Entry::Separator);
+    match kind {
+        SurfaceKind::ClaudeDesktop => {
+            entries.push(app_row(config, kind, "Relaunch Claude", Action::RelaunchApp(kind)));
+            entries.push(app_row(config, kind, "Open Claude (bound profile)", Action::OpenClaude));
+            entries.push(Entry::Separator);
+        }
+        SurfaceKind::ChatgptDesktop => {
+            entries.push(app_row(config, kind, "Relaunch ChatGPT", Action::RelaunchApp(kind)));
+            entries.push(Entry::Separator);
+        }
+        SurfaceKind::ClaudeCli | SurfaceKind::CodexCli => {}
+    }
+    let auto = config.auto.enabled_for(kind);
+    entries.push(toggle("Auto-switch", auto, Action::SetSurfaceAuto(kind, !auto)));
+    entries.push(Entry::Submenu { text: "Priority".into(), entries: priority_entries(config, kind) });
+    let prefix = if kind.is_desktop() { "Desktop" } else { "CLI" };
+    let name = current.map_or_else(|| "unmanaged".to_string(), |id| name_of(config, id));
+    Entry::Submenu { text: format!("{prefix}: {name}"), entries }
+}
+
+/// `1. name`, `2. name`, ... each with "Move up" and "Move down"; a move past either end is disabled.
+fn priority_entries(config: &Config, kind: SurfaceKind) -> Vec<Entry> {
+    let order = config.priority(kind);
+    if order.is_empty() {
+        return vec![Entry::disabled("No saved accounts")];
+    }
+    let step = |text: &str, possible: bool, id: &str, up: bool| {
+        if possible {
+            Entry::item(text, Action::MovePriority { kind, account: id.to_string(), up })
+        } else {
+            Entry::disabled(text)
+        }
+    };
+    order
+        .iter()
+        .enumerate()
+        .map(|(i, id)| Entry::Submenu {
+            text: format!("{}. {}", i + 1, name_of(config, id)),
+            entries: vec![step("Move up", i > 0, id, true), step("Move down", i + 1 < order.len(), id, false)],
+        })
+        .collect()
 }
 
 /// The open question for `kind`, as a row that does what the notification button does.
@@ -356,7 +404,6 @@ fn footer(config: &Config, state: &State, ctx: &Ctx) -> Vec<Entry> {
     let auto = &config.auto;
     let mode = |mode: CodexCliMode, text: &str| Entry::choice(text, auto.codex_cli_mode == mode, Action::SetCodexMode(mode));
     let settings = vec![
-        toggle("Auto-switch", auto.enabled, Action::SetAuto(!auto.enabled)),
         Entry::Submenu {
             text: "Codex CLI auto mode".into(),
             entries: vec![
@@ -395,27 +442,17 @@ pub fn build(config: &Config, state: &State, ctx: &Ctx) -> Vec<Entry> {
         let app_current = policy::current_account(config, state, app);
         let before = out.len();
         for account in config.accounts.iter().filter(|a| a.provider == provider) {
-            out.push(account_entry(config, state, account, (cli, cli_current.as_deref()), (app, app_current.as_deref()), ctx.now));
+            out.push(account_entry(state, account, cli_current.as_deref(), app_current.as_deref(), config.auto.threshold, ctx.now));
         }
         if out.len() == before {
             out.push(Entry::disabled("No saved accounts"));
         }
+        out.push(surface_entry(config, cli, cli_current.as_deref()));
+        out.push(surface_entry(config, app, app_current.as_deref()));
         // Open questions stay at the top level: they ask for an answer.
         for kind in [cli, app] {
             out.extend(pending_entry(config, state, kind, ctx.now));
         }
-        // Everything else about the provider's surfaces sits in one submenu, so the top level stays the account list.
-        let mut options = match provider {
-            Provider::Claude => vec![
-                app_row(config, SurfaceKind::ClaudeDesktop, "Relaunch Claude", Action::RelaunchApp(SurfaceKind::ClaudeDesktop)),
-                app_row(config, SurfaceKind::ClaudeDesktop, "Open Claude (bound profile)", Action::OpenClaude),
-            ],
-            Provider::Openai => vec![app_row(config, SurfaceKind::ChatgptDesktop, "Relaunch ChatGPT", Action::RelaunchApp(SurfaceKind::ChatgptDesktop))],
-        };
-        options.push(Entry::Separator);
-        options.push(unmanaged_entry(cli, cli_current.as_deref()));
-        options.push(unmanaged_entry(app, app_current.as_deref()));
-        out.push(Entry::Submenu { text: "Options".into(), entries: options });
         out.push(Entry::Separator);
     }
     out.extend(footer(config, state, ctx));
@@ -460,10 +497,7 @@ pub fn to_text(entries: &[Entry]) -> String {
                     out.push_str(&format!("{pad}{text} >\n"));
                     walk(entries, depth + 1, out);
                 }
-                Entry::Account(row) => {
-                    out.push_str(&format!("{pad}{} >\n", row_text(row)));
-                    walk(&row.entries, depth + 1, out);
-                }
+                Entry::Account(row) => out.push_str(&format!("{pad}{}\n", row_text(row))),
             }
         }
     }
@@ -513,8 +547,9 @@ fn items(entries: &[Entry], actions: &mut HashMap<MenuId, Action>, counter: &mut
                 }
             }
             Entry::Submenu { text, entries } => out.push(submenu(text, entries, actions, counter)?),
-            // `account_row::attach` draws the icons and bars over this plain title; it stays if that fails.
-            Entry::Account(row) => out.push(submenu(&row_text(row), &row.entries, actions, counter)?),
+            // An enabled item without an action: `account_row::attach` draws the icons and bars over this plain
+            // title (it stays if that fails), and AppKit still highlights the row.
+            Entry::Account(row) => out.push(Box::new(MenuItem::with_id(next_id(counter), escape_title(&row_text(row)), true, None))),
         }
     }
     Ok(out)
@@ -601,46 +636,95 @@ mod tests {
         assert_eq!((oa.cli, oa.app, &oa.usage), (false, false, &Usage::Note("no reading yet")));
 
         let text = to_text(&menu);
-        assert!(
-            text.starts_with(
-                "Claude\n           Personal · 5h 32% · wk 40% >\n  [ ] Use for Claude CLI\n  [ ] Use for Claude Desktop (relaunches app)\n[CLI][APP] Team · 5h 9% · wk 6% >\n"
-            ),
-            "{text}"
-        );
-        assert!(text.contains("ChatGPT and Codex\n           OpenAI Personal · no reading yet >\n"), "{text}");
+        assert!(text.starts_with("Claude\n           Personal · 5h 32% · wk 40%\n[CLI][APP] Team · 5h 9% · wk 6%\nCLI: Team >\n"), "{text}");
+        assert!(text.contains("ChatGPT and Codex\n           OpenAI Personal · no reading yet\nCLI: unmanaged >\n"), "{text}");
         assert_eq!(text.matches("Personal ·").count(), 2, "each account once, under its provider: {text}");
-        assert!(!text.contains("Claude CLI:"), "no per-surface submenus: {text}");
+        assert!(!text.contains("Use for"), "account rows have no submenu: {text}");
     }
 
     #[test]
-    fn an_account_submenu_uses_it_on_either_surface_and_unmanaged_rows_sit_in_the_section() {
-        let c = config(); // Claude CLI is bound to Personal, Claude Desktop to Team
+    fn each_provider_has_a_cli_and_a_desktop_submenu_with_account_auto_switch_and_priority() {
+        let mut c = config(); // Claude CLI is bound to Personal, Claude Desktop to Team
+        c.auto.set_enabled_for(SurfaceKind::ClaudeCli, true);
+        let text = to_text(&build(&c, &State::default(), &ctx()));
+        let claude = "\
+Claude
+[CLI]      Personal · no reading yet
+     [APP] Team · no reading yet
+CLI: Personal >
+  [x] Personal (current)
+  [ ] Team
+  [ ] Leave unmanaged
+  --------
+  [x] Auto-switch
+  Priority >
+    1. Personal >
+      Move up (disabled)
+      Move down
+    2. Team >
+      Move up
+      Move down (disabled)
+Desktop: Team >
+  [ ] Personal (relaunches app)
+  [x] Team (current)
+  [ ] Leave unmanaged
+  --------
+  Relaunch Claude
+  Open Claude (bound profile)
+  --------
+  [ ] Auto-switch
+  Priority >
+    1. Team >
+      Move up (disabled)
+      Move down
+    2. Personal >
+      Move up
+      Move down (disabled)
+--------
+ChatGPT and Codex
+";
+        assert!(text.starts_with(claude), "{text}");
+        assert!(!text.contains("Options"), "{text}");
+    }
+
+    #[test]
+    fn the_surface_submenus_carry_the_actions_of_each_choice() {
+        let mut c = config(); // Claude CLI is bound to Personal, Claude Desktop to Team
+        c.auto.enabled = true;
+        c.priority.claude_desktop = vec!["team".into()];
         let menu = build(&c, &State::default(), &ctx());
         let bind = |kind, id: &str| Action::Bind(kind, Binding::Account(id.into()));
-        let unmanaged = |kind| Entry::choice(format!("Leave {} unmanaged", surface_name(kind)), false, Action::Bind(kind, Binding::Unmanaged));
-        assert_eq!(
-            find_row(&menu, "Personal").entries,
-            vec![
-                Entry::choice("Use for Claude CLI", true, bind(SurfaceKind::ClaudeCli, "personal")),
-                Entry::choice("Use for Claude Desktop (relaunches app)", false, Action::SwitchApp(SurfaceKind::ClaudeDesktop, "personal".into())),
-            ]
-        );
-        let claude_options = options_of(&menu, 0);
-        assert!(claude_options.contains(&unmanaged(SurfaceKind::ClaudeCli)));
-        assert!(claude_options.contains(&unmanaged(SurfaceKind::ClaudeDesktop)));
-        // The app already uses Team: no relaunch suffix, and the checked row does nothing when clicked.
-        let team = &find_row(&menu, "Team").entries;
-        assert_eq!(team[0], Entry::choice("Use for Claude CLI", false, bind(SurfaceKind::ClaudeCli, "team")));
-        assert_eq!(team[1], Entry::Item { text: "Use for Claude Desktop".into(), action: None, checked: Some(true), enabled: true });
 
-        // Both OpenAI surfaces are unmanaged: their rows are checked and do nothing; the names are OpenAI's.
-        let oa = &find_row(&menu, "OpenAI Personal").entries;
-        assert_eq!(oa[0], Entry::choice("Use for Codex CLI", false, bind(SurfaceKind::CodexCli, "oa")));
-        assert_eq!(oa[1], Entry::choice("Use for ChatGPT (relaunches app)", false, Action::SwitchApp(SurfaceKind::ChatgptDesktop, "oa".into())));
-        assert_eq!(oa.len(), 2);
-        let oa_options = options_of(&menu, 1);
-        assert!(oa_options.contains(&Entry::Item { text: "Leave Codex CLI unmanaged".into(), action: None, checked: Some(true), enabled: true }));
-        assert!(oa_options.contains(&Entry::Item { text: "Leave ChatGPT unmanaged".into(), action: None, checked: Some(true), enabled: true }));
+        let cli = submenu_of(&menu, "CLI: Personal");
+        assert_eq!(cli[0], Entry::Item { text: "Personal".into(), action: None, checked: Some(true), enabled: true }, "the current account does nothing");
+        assert_eq!(cli[1], Entry::choice("Team", false, bind(SurfaceKind::ClaudeCli, "team")));
+        assert_eq!(cli[2], Entry::choice("Leave unmanaged", false, Action::Bind(SurfaceKind::ClaudeCli, Binding::Unmanaged)));
+        assert_eq!(cli[4], toggle("Auto-switch", true, Action::SetSurfaceAuto(SurfaceKind::ClaudeCli, false)), "old `enabled = true` means on");
+
+        let desktop = submenu_of(&menu, "Desktop: Team");
+        assert_eq!(desktop[0], Entry::choice("Personal (relaunches app)", false, Action::SwitchApp(SurfaceKind::ClaudeDesktop, "personal".into())));
+        assert_eq!(desktop[1], Entry::Item { text: "Team".into(), action: None, checked: Some(true), enabled: true });
+        // The desktop's bound account (Team) leads its order; the CLI's (Personal) leads the CLI's.
+        let order = |entries: &[Entry]| -> Vec<String> {
+            let Some(Entry::Submenu { entries, .. }) = entries.iter().find(|e| matches!(e, Entry::Submenu { text, .. } if text == "Priority")) else { panic!("no Priority") };
+            entries.iter().map(|e| if let Entry::Submenu { text, .. } = e { text.clone() } else { panic!("{e:?}") }).collect()
+        };
+        assert_eq!(order(cli), ["1. Personal", "2. Team"]);
+        assert_eq!(order(desktop), ["1. Team", "2. Personal"]);
+        let actions: Vec<Action> = flatten(desktop).into_iter().filter_map(|e| if let Entry::Item { action, .. } = e { action.clone() } else { None }).collect();
+        assert!(actions.contains(&Action::MovePriority { kind: SurfaceKind::ClaudeDesktop, account: "team".into(), up: false }));
+        assert!(actions.contains(&Action::MovePriority { kind: SurfaceKind::ClaudeDesktop, account: "personal".into(), up: true }));
+        assert!(!actions.contains(&Action::MovePriority { kind: SurfaceKind::ClaudeDesktop, account: "team".into(), up: true }), "the top cannot move up");
+        assert!(!actions.contains(&Action::MovePriority { kind: SurfaceKind::ClaudeDesktop, account: "personal".into(), up: false }), "the bottom cannot move down");
+
+        // Unmanaged OpenAI surfaces: "Leave unmanaged" is the checked row, and auto-switch has its own toggle.
+        let codex = submenu_of(&menu, "CLI: unmanaged");
+        assert_eq!(codex[0], Entry::choice("OpenAI Personal", false, bind(SurfaceKind::CodexCli, "oa")));
+        assert_eq!(codex[1], Entry::Item { text: "Leave unmanaged".into(), action: None, checked: Some(true), enabled: true });
+        let chatgpt = submenu_of(&menu, "Desktop: unmanaged");
+        assert_eq!(chatgpt[0], Entry::choice("OpenAI Personal (relaunches app)", false, Action::SwitchApp(SurfaceKind::ChatgptDesktop, "oa".into())));
+        assert!(chatgpt.contains(&Entry::disabled("Relaunch ChatGPT (bind ChatGPT first)")));
+        assert!(chatgpt.contains(&toggle("Auto-switch", true, Action::SetSurfaceAuto(SurfaceKind::ChatgptDesktop, false))));
     }
 
     #[test]
@@ -681,7 +765,7 @@ mod tests {
         let mut s = State::default();
         s.usage.insert("personal".into(), reading(85.0, 10.0));
         let menu = build(&c, &s, &ctx());
-        assert!(to_text(&menu).contains("[CLI]      Personal · 5h 85% · wk 10% >"), "{}", to_text(&menu));
+        assert!(to_text(&menu).contains("[CLI]      Personal · 5h 85% · wk 10%\n"), "{}", to_text(&menu));
         s.usage.insert("personal".into(), reading(86.0, 10.0));
         assert!(should_rebuild(&build(&c, &s, &ctx()), &menu, false), "a new reading redraws the row");
     }
@@ -790,7 +874,7 @@ mod tests {
     }
 
     #[test]
-    fn the_footer_has_auto_switch_the_codex_mode_undo_login_item_and_quit() {
+    fn the_footer_has_the_codex_mode_undo_login_item_and_quit() {
         let mut c = config();
         c.auto.enabled = true;
         c.auto.codex_cli_mode = CodexCliMode::Notify;
@@ -799,7 +883,8 @@ mod tests {
         s.record_switch(SurfaceKind::ClaudeCli, "team", 2);
         let menu = build(&c, &s, &Ctx { login: LoginStatus::Enabled, ..ctx() });
         let text = to_text(&menu);
-        assert!(text.contains("[x] Auto-switch"), "{text}");
+        let settings = to_text(submenu_of(&menu, "Settings"));
+        assert!(!settings.contains("Auto-switch"), "auto-switch is set per surface: {settings}");
         assert!(text.contains("[x] Notify only"), "{text}");
         assert!(text.contains("[ ] New sessions only") && text.contains("[ ] Force"), "{text}");
         assert!(text.contains("Undo last switch: Claude CLI back to Personal"), "{text}");
@@ -807,7 +892,6 @@ mod tests {
         assert!(text.contains("Quit agent-switch"), "{text}");
 
         let actions: Vec<Action> = flatten(&menu).into_iter().filter_map(|e| if let Entry::Item { action, .. } = e { action.clone() } else { None }).collect();
-        assert!(actions.contains(&Action::SetAuto(false)));
         assert!(actions.contains(&Action::SetCodexMode(CodexCliMode::Force)));
         assert!(actions.contains(&Action::Undo(SurfaceKind::ClaudeCli)));
         assert!(actions.contains(&Action::SetLoginItem(false)));
@@ -815,16 +899,15 @@ mod tests {
         assert!(!actions.contains(&Action::SetCodexMode(CodexCliMode::Notify)), "the current mode is not clickable");
     }
 
-    /// The "Options" submenu of the `nth` provider section (Claude first).
-    fn options_of(entries: &[Entry], nth: usize) -> &Vec<Entry> {
+    /// The entries of the top-level submenu titled `title`.
+    fn submenu_of<'a>(entries: &'a [Entry], title: &str) -> &'a Vec<Entry> {
         entries
             .iter()
-            .filter_map(|e| match e {
-                Entry::Submenu { text, entries } if text == "Options" => Some(entries),
+            .find_map(|e| match e {
+                Entry::Submenu { text, entries } if text == title => Some(entries),
                 _ => None,
             })
-            .nth(nth)
-            .expect("an Options submenu")
+            .unwrap_or_else(|| panic!("no submenu `{title}` in\n{}", to_text(entries)))
     }
 
     fn flatten(entries: &[Entry]) -> Vec<&Entry> {

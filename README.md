@@ -100,19 +100,36 @@ Desktop keeps the Code-tab session list per profile, so a new account used to op
 
 ### Auto mode
 
-Auto-switching runs inside the menu bar app (one watcher at a time). Configure it in `~/.config/agent-switch/config.toml`:
+Auto-switching runs inside the menu bar app (one watcher at a time). Each provider section of the menu has a `CLI: <account>` and a `Desktop: <account>` submenu. In each one you pick the account (or "Leave unmanaged"), turn auto-switch on or off for that surface, and set the order in which auto-switch uses the accounts ("Priority", with "Move up" and "Move down"). The account rows above them only show which surfaces use each account and its usage.
+
+The same settings live in `~/.config/agent-switch/config.toml`:
 
 ```toml
 [auto]
-enabled = false          # also a menu bar toggle
+enabled = false          # auto-switch for every surface not listed in [auto.surfaces]
 threshold = 90           # percent, applied to both the 5-hour and weekly windows
 hysteresis = 5           # a candidate must be at least this far below the threshold
 cooldown_minutes = 5     # minimum time between automatic switches of one surface
 refresh_inactive = false # opt in: refresh saved logins in the background (see Caveats)
 codex_cli_mode = "new-sessions"  # new-sessions | notify | force
+
+[auto.surfaces]          # optional; written by the menu's per-surface "Auto-switch" toggle
+claude-cli = true
+claude-desktop = false
+codex-cli = true
+chatgpt-desktop = true
+
+[priority]               # optional; per surface, account ids, highest first
+claude-cli = ["team-claude", "personal-claude"]
 ```
 
-- CLI surfaces (`claude-cli`, `codex-cli`) switch automatically. Desktop surfaces raise a notification with a "Relaunch" button; nothing quits until you click.
+- A surface without a `[priority]` list puts its bound account first, then the other accounts in file order, so an older config file never makes a surface move away from its binding. Accounts missing from a list come after the listed ones, in file order, and unknown ids are ignored. Removing an account removes it from every list.
+- Choosing an account by hand makes it the surface's first priority. This covers picking it in the menu, `agent-switch bind`, `agent-switch switch` and "Undo". A Desktop pick that is refused (the binding goes back) changes nothing; one that switched the app keeps the binding and the priority even if the app then fails to come up.
+- Without `[auto.surfaces]`, `enabled` applies to all four surfaces, so older config files keep working as before. The first per-surface toggle in the menu writes all four values.
+- When the current account reaches the threshold, the surface moves to the first account in its priority order that has room.
+- When the current account is below the threshold, the cooldown has passed and no switch-needed event is waiting, the surface moves back to a higher-priority account. That account needs a usage reading from the last 30 minutes with both windows below `threshold - hysteresis`. It also must not be dead, live on another surface that holds its login, or the target of another surface's waiting switch-needed event. A Codex CLI that shares `~/.codex` with the ChatGPT app never splits off to return; the app's event moves both.
+- A return needs that fresh reading of the higher-priority account. With `refresh_inactive = false`, an idle account whose saved login has expired may not get a new reading, so a return can be delayed until you switch to it or turn `refresh_inactive` on.
+- CLI surfaces (`claude-cli`, `codex-cli`) switch automatically. Desktop surfaces raise a notification with a "Relaunch" button, both to move on and to move back; nothing quits until you click.
 - `codex_cli_mode`: `new-sessions` switches the login now and running Codex sessions keep the old account until restarted; `notify` never switches automatically and offers a button; `force` switches now even if a running session then hits a sign-in error.
 - Accounts that are exhausted or have a dead login are skipped. By default a saved login is refreshed only just before you switch to it.
 

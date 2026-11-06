@@ -63,6 +63,9 @@ fn bind_saves_the_binding_even_when_activation_fails() {
     assert!(text(&o).contains("binding saved, but activation failed"), "{}", text(&o));
     let cfg = std::fs::read_to_string(config_path(home.path())).unwrap();
     assert!(cfg.contains("claude-cli = \"personal\""), "{cfg}");
+    // The choice is also the surface's first priority, so auto-switch returns to it.
+    let priority = &cfg[cfg.find("[priority]").unwrap_or_else(|| panic!("no [priority] in {cfg}"))..];
+    assert!(priority.contains("claude-cli = [") && priority.contains("\"personal\""), "{cfg}");
 
     let o = run(home.path(), &["status"]);
     assert!(text(&o).contains("personal"));

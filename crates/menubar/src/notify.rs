@@ -73,7 +73,11 @@ pub fn note_for(event: &Event, config: &Config) -> Option<Note> {
     let key = format!("{}-{:?}-{}", event.ts, event.kind, surface);
     match event.kind {
         EventKind::Switched => {
-            let mut body = format!("{from} is {}. Switched {surface} to {to}.", percent_text(event.pct));
+            let mut body = if event.back {
+                format!("Returning to the higher-priority account: switched {surface} to {to}, which has room again.")
+            } else {
+                format!("{from} is {}. Switched {surface} to {to}.", percent_text(event.pct))
+            };
             if kind == Some(SurfaceKind::CodexCli) {
                 body.push_str(match config.auto.codex_cli_mode {
                     CodexCliMode::Force => " Running Codex sessions may need a new sign-in.",
@@ -90,7 +94,11 @@ pub fn note_for(event: &Event, config: &Config) -> Option<Note> {
             } else {
                 (format!("Switch {surface} to {to}?"), Buttons::SwitchCli, "Running sessions keep the old account until restarted.")
             };
-            let body = format!("{from} is {}. {action}", percent_text(event.pct));
+            let body = if event.back {
+                format!("Returning to the higher-priority account: {to} has room again. {action}")
+            } else {
+                format!("{from} is {}. {action}", percent_text(event.pct))
+            };
             Some(Note { id: relaunch_id(kind, event_id), title, body, buttons })
         }
         EventKind::SwitchFailed => Some(Note::info(key, format!("Could not switch {surface}"), event.detail.clone().unwrap_or_default())),
@@ -242,7 +250,7 @@ mod tests {
     }
 
     fn event(kind: EventKind) -> Event {
-        Event { ts: 100, kind, surface: None, from: None, to: None, id: None, expires_at: None, detail: None, pct: None }
+        Event { ts: 100, kind, surface: None, from: None, to: None, id: None, expires_at: None, detail: None, pct: None, back: false }
     }
 
     #[test]
@@ -251,6 +259,32 @@ mod tests {
         let n = note_for(&e, &config()).unwrap();
         assert_eq!(n.body, "Personal is at 91%. Switched Claude CLI to Team.");
         assert_eq!(n.buttons, Buttons::None);
+    }
+
+    #[test]
+    fn a_return_to_a_higher_priority_account_says_so_instead_of_a_percent() {
+        let mut c = config();
+        let e = Event { surface: Some("claude-cli".into()), from: Some("team".into()), to: Some("personal".into()), pct: Some(40.0), back: true, ..event(EventKind::Switched) };
+        let n = note_for(&e, &c).unwrap();
+        assert_eq!(n.body, "Returning to the higher-priority account: switched Claude CLI to Personal, which has room again.");
+        // The Codex CLI still says what happens to running sessions.
+        let e = Event { surface: Some("codex-cli".into()), ..e };
+        c.auto.codex_cli_mode = CodexCliMode::Force;
+        assert!(note_for(&e, &c).unwrap().body.ends_with("which has room again. Running Codex sessions may need a new sign-in."));
+
+        let e = Event {
+            surface: Some("claude-desktop".into()),
+            from: Some("team".into()),
+            to: Some("personal".into()),
+            id: Some("e1".into()),
+            pct: Some(40.0),
+            back: true,
+            ..event(EventKind::SwitchNeeded)
+        };
+        let n = note_for(&e, &c).unwrap();
+        assert_eq!(n.title, "Relaunch Claude Desktop as Personal?");
+        assert_eq!(n.body, "Returning to the higher-priority account: Personal has room again. Relaunching quits and reopens the app.");
+        assert_eq!(n.buttons, Buttons::Relaunch);
     }
 
     #[test]

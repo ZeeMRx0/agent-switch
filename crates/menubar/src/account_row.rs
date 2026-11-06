@@ -1,14 +1,14 @@
-//! Account rows drawn natively. `menu::render` gives every `Entry::Account` a submenu item with a plain title;
-//! `attach` finds those items by position and gives each one an attributed title:
+//! Account rows drawn natively. `menu::render` gives every `Entry::Account` a plain item with a plain title and
+//! no action; `attach` finds those items by position and gives each one an attributed title:
 //!
 //! ```text
 //! name [CLI] [APP]
 //! 5h ▬▬── 10%   wk ▬─── 16%
 //! ```
 //!
-//! The icons appear only for the surfaces that use the account. The item stays an ordinary submenu item, so
-//! AppKit still highlights it and opens its submenu. Tab stops line the usage columns up between rows; the
-//! percents use monospaced digits.
+//! The icons appear only for the surfaces that use the account. The item stays an ordinary enabled item, so
+//! AppKit still highlights it. Tab stops line the usage columns up between rows; the percents use monospaced
+//! digits.
 //!
 //! The icons and bars are images whose drawing handler runs each time AppKit draws them, so the colors they
 //! use (`labelColor`, `quaternaryLabelColor`, the system tier colors) resolve against the menu's light or dark

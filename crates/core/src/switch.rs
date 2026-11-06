@@ -52,8 +52,8 @@ pub fn undo_record(paths: &Paths, kind: Option<SurfaceKind>) -> Result<SwitchRec
     State::load(paths)?.undo_target(kind).cloned().ok_or_else(|| Error::NotFound("a switch to undo".into()))
 }
 
-/// Re-activate the previous account of the newest switch on `surface`, from its current vault slot.
-/// Returns the restored account id.
+/// Re-activate the previous account of the newest switch on `surface`, from its current vault slot, and make
+/// it the surface's first priority (an undo is a manual choice). Returns the restored account id.
 pub fn undo(env: &Env, config: &Config, surface: &dyn Surface) -> Result<String> {
     let kind = surface.kind();
     let record = undo_record(env.paths, Some(kind))?;
@@ -69,16 +69,36 @@ pub fn undo(env: &Env, config: &Config, surface: &dyn Surface) -> Result<String>
     staged.held = ids.iter().map(|id| id.to_string()).collect();
     surface.apply(env, staged)?;
     State::update(env.paths, |s| s.complete_undo(kind))?;
+    promote(env.paths, kind, &previous)?;
     Ok(previous)
 }
 
 /// Change the binding in `config.toml`. Activation is a separate step so a failed activation never
-/// loses the user's choice.
+/// loses the user's choice. The priority is left alone; `choose` is the user's pick.
 pub fn bind(paths: &Paths, kind: SurfaceKind, binding: Binding) -> Result<Config> {
     Config::update(paths, |config| {
         config.bind(kind, binding)?;
         Ok(config.clone())
     })
+}
+
+/// The user picked `binding` for `kind`: bind it and, for an account, make it the first priority, in one
+/// write.
+pub fn choose(paths: &Paths, kind: SurfaceKind, binding: Binding) -> Result<Config> {
+    Config::update(paths, |config| {
+        config.bind(kind, binding.clone())?;
+        if let Some(id) = binding.account_id() {
+            config.promote(kind, id)?;
+        }
+        Ok(config.clone())
+    })
+}
+
+/// Make `id` the first priority of `kind` after the user switched to it by hand, so auto-switch returns to
+/// it rather than away from it. Called only once the switch has succeeded.
+pub fn promote(paths: &Paths, kind: SurfaceKind, id: &str) -> Result<()> {
+    Config::update(paths, |config| config.promote(kind, id))
+        .map_err(|e| Error::Invalid(format!("`{kind}` now uses `{id}`, but saving it as the first priority failed: {e}")))
 }
 
 /// Keep a recovery copy of a live Claude login that no saved account owns. The vault id is derived from
@@ -349,6 +369,35 @@ mod tests {
         assert!(f.vault.get("personal", "claude-oauth").unwrap().is_none());
         assert!(State::load(&f.paths).unwrap().journal.is_empty());
         assert!(f.vault.get("team", "claude-oauth").unwrap().is_some());
+    }
+
+    #[test]
+    fn choosing_an_account_binds_it_and_makes_it_the_first_priority() {
+        let f = fixture();
+        choose(&f.paths, SurfaceKind::ClaudeCli, Binding::parse("team")).unwrap();
+        let c = Config::load(&f.paths).unwrap();
+        assert_eq!(c.surfaces.get(SurfaceKind::ClaudeCli).account_id(), Some("team"));
+        assert_eq!(c.priority.claude_cli, ["team", "personal"]);
+        assert!(c.priority.claude_desktop.is_empty(), "other surfaces keep their order");
+        // Unmanaged changes only the binding; a bad choice changes nothing.
+        choose(&f.paths, SurfaceKind::ClaudeCli, Binding::Unmanaged).unwrap();
+        assert!(choose(&f.paths, SurfaceKind::ClaudeCli, Binding::parse("gpt")).is_err());
+        let c = Config::load(&f.paths).unwrap();
+        assert_eq!((c.surfaces.get(SurfaceKind::ClaudeCli), c.priority.claude_cli.as_slice()), (&Binding::Unmanaged, ["team".to_string(), "personal".to_string()].as_slice()));
+        // A plain bind (the rollback after a failed switch) leaves the priority alone.
+        bind(&f.paths, SurfaceKind::ClaudeCli, Binding::parse("personal")).unwrap();
+        assert_eq!(Config::load(&f.paths).unwrap().priority.claude_cli, ["team", "personal"]);
+    }
+
+    #[test]
+    fn undo_makes_the_restored_account_the_first_priority() {
+        let f = fixture();
+        let env = Env { paths: &f.paths, vault: &f.vault };
+        let s = Fake::new(SurfaceKind::ClaudeCli);
+        activate(&env, &f.config, &s, "team").unwrap();
+        activate(&env, &f.config, &s, "personal").unwrap();
+        assert_eq!(undo(&env, &f.config, &s).unwrap(), "team");
+        assert_eq!(Config::load(&f.paths).unwrap().priority(SurfaceKind::ClaudeCli), ["team", "personal"]);
     }
 
     #[test]
