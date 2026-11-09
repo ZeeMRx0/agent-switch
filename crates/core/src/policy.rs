@@ -46,6 +46,9 @@ pub const MOVEMENT_DELTA_PCT: f64 = 1.0;
 /// Margin / movement delta: the most urgent polls one episode can take.
 pub const MAX_URGENT_STREAK: u32 = 15;
 const RESET_SLACK_S: u64 = 60;
+/// Retry delay after a request that never reached the server (`network` or `timeout`), so readings come back
+/// soon after the connection returns.
+pub const OFFLINE_RETRY_S: u64 = 60;
 const JITTER_FRAC: f64 = 0.1;
 
 /// A reading older than this is stale: it no longer supports a switch decision.
@@ -128,9 +131,13 @@ pub fn plan_after_fetch(prev: Option<&UsageRecord>, new: &Windows, is_active: bo
 /// `(next_poll_at, interval_s)` after a reading that produced no numbers. A 429 stretches the interval
 /// (AIMD, `poll_policy.py`), honoring `Retry-After`; other failures back off toward 10 minutes; an expired
 /// token is only a local check, so it keeps the 180 s cadence; a dead login is rechecked every 10 minutes
-/// in case a new sign-in replaced it.
+/// in case a new sign-in replaced it. A request that never reached the server (offline) is retried after a
+/// minute and keeps the stored interval, so an outage does not stretch the cadence.
 pub fn plan_after_failure(prev: Option<&UsageRecord>, rec: &UsageRecord, retry_after_s: Option<u64>, now: u64, jitter: f64) -> (u64, u64) {
     let base = prev.map(|p| p.interval_s).filter(|s| *s > 0).unwrap_or(MIN_INTERVAL_S);
+    if rec.state == UsageState::Unreadable && matches!(rec.detail.as_deref(), Some("network" | "timeout")) {
+        return (schedule(now, OFFLINE_RETRY_S, jitter), base);
+    }
     let mut interval = match rec.state {
         UsageState::Dead => EXHAUSTED_INTERVAL_S,
         UsageState::Expired | UsageState::Ok => MIN_INTERVAL_S,
@@ -921,6 +928,18 @@ mod tests {
         assert_eq!(plan_after_failure(Some(&prev), &failed, None, T0, 0.0).1, 270, "other failures back off gently");
         failed.state = UsageState::Expired;
         assert_eq!(plan_after_failure(Some(&prev), &failed, None, T0, 0.0).1, 180);
+    }
+
+    #[test]
+    fn an_offline_failure_retries_in_a_minute_and_keeps_the_interval() {
+        let mut prev = rec(10.0, 10.0);
+        prev.interval_s = 600;
+        for kind in ["network", "timeout"] {
+            let failed = UsageRecord { state: UsageState::Unreadable, detail: Some(kind.into()), ..UsageRecord::default() };
+            assert_eq!(plan_after_failure(Some(&prev), &failed, None, T0, 0.0), (T0 + OFFLINE_RETRY_S, 600), "{kind}");
+        }
+        let failed = UsageRecord { state: UsageState::Unreadable, detail: Some("http-503".into()), ..UsageRecord::default() };
+        assert_eq!(plan_after_failure(Some(&prev), &failed, None, T0, 0.0).1, 600, "a server error still backs off");
     }
 
     #[test]
