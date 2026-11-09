@@ -288,7 +288,7 @@ fn live_text_in_hex_form_is_accepted() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Switch, save-back, undo
+// Switch, save-back, switching back
 // ---------------------------------------------------------------------------------------------
 
 #[test]
@@ -329,7 +329,7 @@ fn switch_replaces_the_login_and_identity_and_keeps_everything_else() {
 }
 
 #[test]
-fn undo_restores_the_account_that_was_refreshed_in_between() {
+fn switching_back_restores_the_account_that_was_refreshed_in_between() {
     let fx = Fx::new();
     let a = fx.adapter();
     fx.switch(&a, "personal").unwrap();
@@ -347,8 +347,7 @@ fn undo_restores_the_account_that_was_refreshed_in_between() {
     team_live.insert("claudeAiOauth".into(), json!({"accessToken": "acc-T2", "refreshToken": "ref-T1", "expiresAt": 3}));
     fx.set_live(&team_live);
 
-    let restored = switch::undo(&fx.env(), &fx.config(), &a).unwrap();
-    assert_eq!(restored, "personal");
+    fx.switch(&a, "personal").unwrap();
     let live = fx.live_obj();
     assert_eq!(token(&live, "refreshToken").unwrap(), "ref-P2");
     assert_eq!(live["trustedDeviceToken"], json!("tdt-P"));

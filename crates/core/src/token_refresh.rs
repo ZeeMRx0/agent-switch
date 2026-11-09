@@ -147,6 +147,8 @@ pub fn freshen(ctx: &Ctx, account: &Account, now: u64, within_s: u64) -> Result<
 
     match ctx.api.refresh(account, &slot.blob, now) {
         Ok(new_blob) => {
+            // A provider that keeps the refresh token (same fingerprint) leaves the saved one usable.
+            let kept = ctx.api.credential(account, &new_blob).is_ok_and(|c| c.fingerprint == cred.fingerprint);
             let committed = commit(ctx, account, new_blob, now);
             match committed {
                 Ok(()) => {
@@ -154,6 +156,12 @@ pub fn freshen(ctx: &Ctx, account: &Account, now: u64, within_s: u64) -> Result<
                         s.refresh_inflight.remove(id);
                     })?;
                     Ok(Freshened::Refreshed)
+                }
+                Err(e) if kept => {
+                    State::update(paths, |s| {
+                        s.refresh_inflight.remove(id);
+                    })?;
+                    Err(FreshenError::Transient(format!("the refreshed login could not be saved; the saved refresh token still works ({e})")))
                 }
                 Err(e) => {
                     // The server rotated the token and we could not keep the result: the old token is spent.
@@ -380,6 +388,22 @@ mod tests {
         assert!(matches!(r, Err(FreshenError::Other(Error::Keychain(_)))), "{r:?}");
         let st = State::load(&f.paths).unwrap();
         assert_eq!(st.usage["a"].state, UsageState::Dead);
+        assert!(st.refresh_inflight.is_empty());
+
+        // A refresh that kept the refresh token: the saved login still works, so the failure is transient.
+        kc.1.store(false, std::sync::atomic::Ordering::SeqCst);
+        let rt = "rt-kept";
+        vault.put("a", "claude-oauth", &Slot { blob: blob(T0 + 10, rt), fingerprint: crate::vault::lineage_fingerprint(rt), refreshed_at: 1 }).unwrap();
+        State::update(&f.paths, |s| {
+            s.usage.remove("a");
+        })
+        .unwrap();
+        f.api.script_refresh("a", Ok(blob(T0 + 3600, rt)));
+        kc.1.store(true, std::sync::atomic::Ordering::SeqCst);
+        let r = freshen(&Ctx { env: &env, api: &f.api }, f.config.account("a").unwrap(), T0, FRESHEN_WITHIN_S);
+        assert!(matches!(r, Err(FreshenError::Transient(_))), "{r:?}");
+        let st = State::load(&f.paths).unwrap();
+        assert!(st.usage.get("a").is_none_or(|r| r.state != UsageState::Dead));
         assert!(st.refresh_inflight.is_empty());
     }
 }

@@ -4,7 +4,7 @@
 //!   (`mkdir` is the mutex; a lock whose mtime is older than `stale` is dead). Ported from claude-swap
 //!   `claude_locks.py` (staleness numbers, serialized takeover through a sibling `.takeover` directory).
 //! * `AccountLock`: one cross-process `flock` per account, held across every vault read, refresh,
-//!   write, save-back, activate and undo for that account.
+//!   write, save-back and activate for that account.
 //! * `WatcherLock`: singleton `flock` so only one watcher runs (claude-swap `switcher.py:2378-2395`).
 
 use std::fs::{File, OpenOptions};
@@ -196,7 +196,7 @@ impl FlockGuard {
     }
 }
 
-/// Held across every vault read, refresh, write, save-back, activate and undo for one account.
+/// Held across every vault read, refresh, write, save-back and activate for one account.
 pub struct AccountLock(#[allow(dead_code)] FlockGuard);
 
 impl AccountLock {

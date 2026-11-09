@@ -21,14 +21,18 @@ const CONFIG_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 pub enum Provider {
     Claude,
     Openai,
+    Antigravity,
 }
 
 impl Provider {
+    pub const ALL: [Provider; 3] = [Provider::Claude, Provider::Openai, Provider::Antigravity];
+
     /// Keychain slot name for this provider's login (`<id>:<store>`).
     pub fn store(self) -> &'static str {
         match self {
             Provider::Claude => "claude-oauth",
             Provider::Openai => "openai-auth",
+            Provider::Antigravity => "antigravity-oauth",
         }
     }
 }
@@ -38,6 +42,7 @@ impl fmt::Display for Provider {
         f.write_str(match self {
             Provider::Claude => "claude",
             Provider::Openai => "openai",
+            Provider::Antigravity => "antigravity",
         })
     }
 }
@@ -49,11 +54,17 @@ pub enum SurfaceKind {
     ClaudeDesktop,
     CodexCli,
     ChatgptDesktop,
+    AntigravityCli,
 }
 
 impl SurfaceKind {
-    pub const ALL: [SurfaceKind; 4] =
-        [SurfaceKind::ClaudeCli, SurfaceKind::ClaudeDesktop, SurfaceKind::CodexCli, SurfaceKind::ChatgptDesktop];
+    pub const ALL: [SurfaceKind; 5] = [
+        SurfaceKind::ClaudeCli,
+        SurfaceKind::ClaudeDesktop,
+        SurfaceKind::CodexCli,
+        SurfaceKind::ChatgptDesktop,
+        SurfaceKind::AntigravityCli,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -61,6 +72,7 @@ impl SurfaceKind {
             SurfaceKind::ClaudeDesktop => "claude-desktop",
             SurfaceKind::CodexCli => "codex-cli",
             SurfaceKind::ChatgptDesktop => "chatgpt-desktop",
+            SurfaceKind::AntigravityCli => "antigravity-cli",
         }
     }
 
@@ -68,6 +80,7 @@ impl SurfaceKind {
         match self {
             SurfaceKind::ClaudeCli | SurfaceKind::ClaudeDesktop => Provider::Claude,
             SurfaceKind::CodexCli | SurfaceKind::ChatgptDesktop => Provider::Openai,
+            SurfaceKind::AntigravityCli => Provider::Antigravity,
         }
     }
 
@@ -144,7 +157,7 @@ pub struct Account {
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
-    /// Provider-side account identifier (Claude `accountUuid`, OpenAI `account_id`).
+    /// Provider-side account identifier (Claude `accountUuid`, OpenAI `account_id`). Antigravity has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uuid: Option<String>,
 }
@@ -170,6 +183,7 @@ pub struct Surfaces {
     pub claude_desktop: Binding,
     pub codex_cli: Binding,
     pub chatgpt_desktop: Binding,
+    pub antigravity_cli: Binding,
 }
 
 impl Surfaces {
@@ -179,6 +193,7 @@ impl Surfaces {
             SurfaceKind::ClaudeDesktop => &self.claude_desktop,
             SurfaceKind::CodexCli => &self.codex_cli,
             SurfaceKind::ChatgptDesktop => &self.chatgpt_desktop,
+            SurfaceKind::AntigravityCli => &self.antigravity_cli,
         }
     }
 
@@ -188,12 +203,13 @@ impl Surfaces {
             SurfaceKind::ClaudeDesktop => &mut self.claude_desktop,
             SurfaceKind::CodexCli => &mut self.codex_cli,
             SurfaceKind::ChatgptDesktop => &mut self.chatgpt_desktop,
+            SurfaceKind::AntigravityCli => &mut self.antigravity_cli,
         }
     }
 }
 
 /// The order in which auto-switch tries the accounts of each surface, highest first. A surface without a list
-/// puts its bound account first, then config order. Ids that are unknown or belong to the other provider are
+/// puts its bound account first, then config order. Ids that are unknown or belong to another provider are
 /// ignored, so the file never fails to load because of this table.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default)]
@@ -206,6 +222,8 @@ pub struct Priority {
     pub codex_cli: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub chatgpt_desktop: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub antigravity_cli: Vec<String>,
 }
 
 impl Priority {
@@ -215,6 +233,7 @@ impl Priority {
             SurfaceKind::ClaudeDesktop => &self.claude_desktop,
             SurfaceKind::CodexCli => &self.codex_cli,
             SurfaceKind::ChatgptDesktop => &self.chatgpt_desktop,
+            SurfaceKind::AntigravityCli => &self.antigravity_cli,
         }
     }
 
@@ -224,6 +243,7 @@ impl Priority {
             SurfaceKind::ClaudeDesktop => &mut self.claude_desktop,
             SurfaceKind::CodexCli => &mut self.codex_cli,
             SurfaceKind::ChatgptDesktop => &mut self.chatgpt_desktop,
+            SurfaceKind::AntigravityCli => &mut self.antigravity_cli,
         }
     }
 
@@ -244,6 +264,8 @@ pub struct AutoSurfaces {
     pub codex_cli: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chatgpt_desktop: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub antigravity_cli: Option<bool>,
 }
 
 impl AutoSurfaces {
@@ -253,6 +275,7 @@ impl AutoSurfaces {
             SurfaceKind::ClaudeDesktop => self.claude_desktop,
             SurfaceKind::CodexCli => self.codex_cli,
             SurfaceKind::ChatgptDesktop => self.chatgpt_desktop,
+            SurfaceKind::AntigravityCli => self.antigravity_cli,
         }
     }
 
@@ -262,6 +285,7 @@ impl AutoSurfaces {
             SurfaceKind::ClaudeDesktop => &mut self.claude_desktop,
             SurfaceKind::CodexCli => &mut self.codex_cli,
             SurfaceKind::ChatgptDesktop => &mut self.chatgpt_desktop,
+            SurfaceKind::AntigravityCli => &mut self.antigravity_cli,
         }
     }
 
@@ -784,8 +808,45 @@ mod tests {
     }
 
     #[test]
+    fn the_antigravity_cli_takes_antigravity_accounts_with_its_own_priority_and_auto_switch() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(d.path());
+        let mut c = claude3();
+        c.add_account(acct("g1", Provider::Antigravity)).unwrap();
+        c.add_account(acct("g2", Provider::Antigravity)).unwrap();
+        assert!(c.bind(SurfaceKind::AntigravityCli, Binding::parse("a")).is_err(), "a Claude account does not fit");
+        c.bind(SurfaceKind::AntigravityCli, Binding::parse("g2")).unwrap();
+        assert_eq!(c.priority(SurfaceKind::AntigravityCli), ["g2", "g1"]);
+        assert_eq!(c.priority(SurfaceKind::ClaudeCli), ["a", "b", "c"], "other providers' lists ignore it");
+        c.move_priority(SurfaceKind::AntigravityCli, "g1", true).unwrap();
+        c.auto.set_enabled_for(SurfaceKind::AntigravityCli, true);
+        assert!(!SurfaceKind::AntigravityCli.is_desktop());
+        assert_eq!(SurfaceKind::AntigravityCli.provider().store(), "antigravity-oauth");
+        c.save(&paths).unwrap();
+        assert_eq!(Config::load(&paths).unwrap(), c);
+        let text = std::fs::read_to_string(paths.config_file()).unwrap();
+        assert!(text.contains("antigravity-cli = \"g2\"") && text.contains("antigravity-cli = [") && text.contains("antigravity-cli = true"), "{text}");
+        assert!(text.contains("provider = \"antigravity\""), "{text}");
+    }
+
+    #[test]
+    fn an_old_config_without_antigravity_follows_auto_enabled_for_it() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(d.path());
+        std::fs::create_dir_all(paths.config_file().parent().unwrap()).unwrap();
+        let old = "[[accounts]]\nid = \"a\"\nprovider = \"claude\"\n[surfaces]\nclaude-cli = \"a\"\nclaude-desktop = \"unmanaged\"\n\
+                   codex-cli = \"unmanaged\"\nchatgpt-desktop = \"unmanaged\"\n[auto]\nenabled = true\n[auto.surfaces]\nclaude-cli = true\n";
+        std::fs::write(paths.config_file(), old).unwrap();
+        let c = Config::load(&paths).unwrap();
+        assert_eq!(*c.surfaces.get(SurfaceKind::AntigravityCli), Binding::Unmanaged);
+        assert!(c.auto.enabled_for(SurfaceKind::AntigravityCli), "no value: follows auto.enabled");
+        assert!(c.priority(SurfaceKind::AntigravityCli).is_empty());
+    }
+
+    #[test]
     fn surface_names_parse() {
         assert_eq!("codex-cli".parse::<SurfaceKind>().unwrap(), SurfaceKind::CodexCli);
+        assert_eq!("antigravity-cli".parse::<SurfaceKind>().unwrap(), SurfaceKind::AntigravityCli);
         assert!("codex".parse::<SurfaceKind>().is_err());
     }
 

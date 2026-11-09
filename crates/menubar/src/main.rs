@@ -6,6 +6,7 @@
 //! `UserEvent`s and `worker::Cmd`s only.
 
 mod account_row;
+mod add_account;
 mod icon;
 mod login_item;
 mod menu;

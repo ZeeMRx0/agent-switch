@@ -2,8 +2,9 @@
 //!
 //! Where the login comes from decides whether a reading may refresh it:
 //! * An account that is **active** on a surface that holds its token chain (`claude-cli`, `codex-cli`,
-//!   `chatgpt-desktop`) is read **live** from that surface. The CLI or the app owns the refresh of that
-//!   login, so agent-switch never refreshes it and reports `expired` when the access token has lapsed.
+//!   `chatgpt-desktop`, `antigravity-cli`) is read **live** from that surface. The CLI or the app owns the
+//!   refresh of that login, so agent-switch never refreshes it and reports `expired` when the access token
+//!   has lapsed.
 //! * Any other account is read from the vault. It is refreshed in the background only when the user opted in
 //!   (`auto.refresh_inactive`); by default a lapsed token shows `expired` and the last-known numbers, and
 //!   the login is refreshed just before a switch (see `token_refresh`).
@@ -20,6 +21,7 @@ use crate::config::{Account, Config, Provider, SurfaceKind};
 use crate::error::{Error, Result};
 use crate::policy;
 use crate::providers::anthropic::AnthropicApi;
+use crate::providers::antigravity::AntigravityApi;
 use crate::providers::openai::OpenaiApi;
 use crate::state::{State, UsageRecord, UsageState, Windows};
 use crate::surface::{Env, Surface};
@@ -88,11 +90,12 @@ pub trait ProviderApi {
 pub struct LiveApi {
     anthropic: AnthropicApi,
     openai: OpenaiApi,
+    antigravity: AntigravityApi,
 }
 
 impl LiveApi {
     pub fn production() -> LiveApi {
-        LiveApi { anthropic: AnthropicApi::default(), openai: OpenaiApi::default() }
+        LiveApi { anthropic: AnthropicApi::default(), openai: OpenaiApi::default(), antigravity: AntigravityApi::default() }
     }
 }
 
@@ -101,6 +104,7 @@ impl ProviderApi for LiveApi {
         match account.provider {
             Provider::Claude => crate::providers::anthropic::credential(blob),
             Provider::Openai => crate::providers::openai::credential(blob),
+            Provider::Antigravity => crate::providers::antigravity::credential(blob),
         }
     }
 
@@ -108,6 +112,7 @@ impl ProviderApi for LiveApi {
         match account.provider {
             Provider::Claude => self.anthropic.fetch_usage(cred),
             Provider::Openai => self.openai.fetch_usage(cred),
+            Provider::Antigravity => self.antigravity.fetch_usage(cred),
         }
     }
 
@@ -115,6 +120,7 @@ impl ProviderApi for LiveApi {
         match account.provider {
             Provider::Claude => self.anthropic.refresh(blob, now),
             Provider::Openai => self.openai.refresh(blob, now),
+            Provider::Antigravity => self.antigravity.refresh(blob, now),
         }
     }
 }
@@ -163,6 +169,21 @@ pub(crate) fn http_get(url: &str, headers: &[(&str, &str)]) -> std::result::Resu
 
 pub(crate) fn http_post_json(url: &str, body: &Value) -> std::result::Result<Reply, String> {
     let req = agent(POST_TIMEOUT).post(url).header("User-Agent", concat!("agent-switch/", env!("CARGO_PKG_VERSION")));
+    into_reply(req.send_json(body).map_err(|e| transport_kind(&e))?)
+}
+
+/// A token request with a form body (`application/x-www-form-urlencoded`), under the refresh timeout.
+pub(crate) fn http_post_form(url: &str, form: &[(&str, &str)]) -> std::result::Result<Reply, String> {
+    let req = agent(POST_TIMEOUT).post(url).header("User-Agent", concat!("agent-switch/", env!("CARGO_PKG_VERSION")));
+    into_reply(req.send_form(form.iter().copied()).map_err(|e| transport_kind(&e))?)
+}
+
+/// A usage request that is a POST with a JSON body, under the usage timeout.
+pub(crate) fn http_post_usage(url: &str, headers: &[(&str, &str)], body: &Value) -> std::result::Result<Reply, String> {
+    let mut req = agent(GET_TIMEOUT).post(url);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
     into_reply(req.send_json(body).map_err(|e| transport_kind(&e))?)
 }
 
@@ -577,6 +598,50 @@ mod tests {
         assert_eq!(rec.windows, windows(40.0, 50.0), "last-known values are kept");
         assert_eq!(age_s(&rec, T0), Some(7200));
         assert_eq!(f.api.calls(), Vec::<String>::new(), "no usage request and no refresh");
+    }
+
+    #[test]
+    fn an_antigravity_account_reads_its_quota_through_the_live_api_and_an_expired_login_shows_expired() {
+        use crate::providers::antigravity::{tests::login_json, AntigravityApi, Login};
+        let mut f = Fixture::new(&[]);
+        f.config.add_account(Account { id: "g".into(), provider: Provider::Antigravity, label: "g".into(), email: None, uuid: None }).unwrap();
+        f.config.save(&f.paths).unwrap();
+        let put = |expiry: &str| {
+            let blob = login_json("g@gmail.com", "ya29.fake", "1//rt-g", expiry);
+            let fingerprint = Login::parse(&blob).unwrap().fingerprint;
+            f.vault.put("g", "antigravity-oauth", &Slot { blob, fingerprint, refreshed_at: 1 }).unwrap();
+        };
+        let poll_with = |api: &LiveApi| {
+            let env = f.env();
+            let ctx = Ctx { env: &env, config: &f.config, api, surfaces: &surfaces_none() };
+            poll_account(&ctx, f.config.account("g").unwrap(), T0).unwrap()
+        };
+
+        // T0 is 2027-01-15T08:00:00Z. An access token that lapsed an hour ago: nothing is sent (the port is closed).
+        put("2027-01-15T14:00:00+07:00");
+        let closed = LiveApi { antigravity: AntigravityApi::with_base("http://127.0.0.1:9"), ..LiveApi::production() };
+        let rec = poll_with(&closed);
+        assert_eq!(rec.state, UsageState::Expired, "{:?}", rec.detail);
+
+        // A valid one: the most-used model with a reset decides each window. The endpoint's reset times are
+        // classified against the clock, so they are built from it.
+        put("2027-01-15T16:00:00+07:00");
+        let wall = crate::state::now_secs();
+        let at = crate::providers::openai::rfc3339_utc;
+        let body = serde_json::json!({"models": {
+            "gemini-3-pro": {"quotaInfo": {"remainingFraction": 0.25, "resetTime": at(wall + 5 * 86_400)}},
+            "claude-sonnet": {"quotaInfo": {"remainingFraction": 0.9, "resetTime": at(wall + 7200)}},
+            "no-limit": {}
+        }});
+        let (base, server) = serve("200 OK", &body.to_string());
+        let rec = poll_with(&LiveApi { antigravity: AntigravityApi::with_base(&base), ..LiveApi::production() });
+        let request = server.join().unwrap();
+        assert!(request.contains("Bearer ya29.fake"));
+        assert_eq!(rec.state, UsageState::Ok, "{:?}", rec.detail);
+        let week = rec.windows.weekly.unwrap();
+        let five = rec.windows.five_hour.unwrap();
+        assert_eq!((week.pct.round(), five.pct.round()), (75.0, 10.0));
+        assert_eq!(five.resets_at, Some(wall as i64 + 7200));
     }
 
     #[test]

@@ -29,7 +29,8 @@ use agent_switch_core::vault::Vault;
 use agent_switch_core::watcher::{Event, Relaunch, Watcher};
 use agent_switch_core::{switch, Error, Result};
 
-use crate::menu::{label_of, surface_name, Action};
+use crate::add_account;
+use crate::menu::{label_of, provider_title, surface_name, Action};
 
 pub enum Cmd {
     Do(Action),
@@ -347,10 +348,9 @@ impl Job<'_> {
                 let opened = claude_desktop::open_account_profile(&SystemApps, paths, &id)?;
                 Ok(Some(if opened { format!("Opened Claude on {label}.") } else { format!("Claude is already open on {label}.") }))
             }
-            Action::Undo(kind) => {
-                let config = Config::load(paths)?;
-                let restored = switch::undo(self.env, &config, surface_for(kind).as_ref())?;
-                Ok(Some(format!("{} is back on {}.", surface_name(kind), label_of(&config, &restored))))
+            Action::AddAccount(provider) => {
+                add_account::open_terminal(paths, provider)?;
+                Ok(Some(format!("Opened Terminal to add a {} account.", provider_title(provider))))
             }
             Action::Relaunch { kind, event_id } => {
                 self.consent.set(true);

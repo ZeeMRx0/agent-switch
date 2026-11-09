@@ -1,5 +1,6 @@
 //! Surface adapters.
 
+pub mod antigravity_cli;
 pub mod claude_code;
 pub mod claude_desktop;
 pub mod chatgpt_desktop;
@@ -17,5 +18,6 @@ pub fn surface_for(kind: SurfaceKind) -> Box<dyn Surface> {
         SurfaceKind::CodexCli => Box::new(codex_cli::CodexCli),
         SurfaceKind::ChatgptDesktop => Box::new(chatgpt_desktop::ChatgptDesktop::production()),
         SurfaceKind::ClaudeDesktop => Box::new(claude_desktop::ClaudeDesktop::production()),
+        SurfaceKind::AntigravityCli => Box::new(antigravity_cli::AntigravityCli::production()),
     }
 }

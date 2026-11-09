@@ -10,6 +10,9 @@ fn run(home: &Path, args: &[&str]) -> Output {
     cmd.env("HOME", home);
     // Point Claude Code's Keychain lookup at an item that cannot exist, so no test reads the real login.
     cmd.env("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/nonexistent/agent-switch-test");
+    // Likewise for agy's item, and keep the installed `agy` off PATH.
+    cmd.env("AGENT_SWITCH_ANTIGRAVITY_SERVICE", "agent-switch-test-nonexistent");
+    cmd.env("PATH", "/usr/bin:/bin");
     cmd.output().expect("run agent-switch")
 }
 
@@ -46,7 +49,7 @@ fn status_on_a_fresh_home_lists_every_surface_as_unmanaged() {
     let o = run(home.path(), &["status"]);
     assert!(o.status.success(), "{}", text(&o));
     let out = text(&o);
-    for s in ["claude-cli", "claude-desktop", "codex-cli", "chatgpt-desktop"] {
+    for s in ["claude-cli", "claude-desktop", "codex-cli", "chatgpt-desktop", "antigravity-cli"] {
         assert!(out.contains(s), "{out}");
     }
     assert!(out.contains("unmanaged"));
@@ -109,15 +112,12 @@ fn remove_refuses_a_bound_account_then_removes_it_once_unbound() {
 }
 
 #[test]
-fn switch_needs_a_bound_surface_and_undo_needs_history() {
+fn switch_needs_a_bound_surface() {
     let home = tempfile::tempdir().unwrap();
     write_config(home.path(), TWO_ACCOUNTS);
     let o = run(home.path(), &["switch", "claude-cli", "personal"]);
     assert!(!o.status.success());
     assert!(text(&o).contains("unmanaged"), "{}", text(&o));
-    let o = run(home.path(), &["undo"]);
-    assert!(!o.status.success());
-    assert!(text(&o).contains("a switch to undo"), "{}", text(&o));
 }
 
 #[test]
@@ -197,4 +197,25 @@ fn switch_offers_force_and_desktop_sessions_rejects_an_unknown_action() {
     assert!(text(&o).contains("use `on` or `off`"), "{}", text(&o));
     let o = run(home.path(), &["desktop-sessions", "--help"]);
     assert!(text(&o).contains("--dry-run"), "{}", text(&o));
+}
+
+#[test]
+fn add_antigravity_cli_without_a_login_says_to_sign_in_with_agy_and_writes_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    let o = run(home.path(), &["add", "antigravity-cli", "--id", "g"]);
+    assert!(!o.status.success());
+    assert!(text(&o).contains("Run `agy`, sign in"), "{}", text(&o));
+    let o = run(home.path(), &["add", "antigravity-cli", "--id", "g", "--dry-run"]);
+    assert!(!o.status.success() && text(&o).contains("Run `agy`, sign in"), "{}", text(&o));
+    let o = run(home.path(), &["add", "antigravity-cli"]);
+    assert!(!o.status.success() && text(&o).contains("--id"), "{}", text(&o));
+    assert!(!config_path(home.path()).exists());
+}
+
+#[test]
+fn doctor_reports_the_antigravity_item_and_a_missing_agy() {
+    let home = tempfile::tempdir().unwrap();
+    let out = text(&run(home.path(), &["doctor"]));
+    assert!(out.contains("[skip] antigravity storage: no login"), "{out}");
+    assert!(out.contains("[skip] agy version: agy is not installed"), "{out}");
 }

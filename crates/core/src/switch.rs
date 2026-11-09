@@ -1,4 +1,4 @@
-//! Orchestration shared by every surface: activate, undo, bind and remove. Adapters supply
+//! Orchestration shared by every surface: activate, bind and remove. Adapters supply
 //! `stage`/`apply`; this module owns locking and the `state.json` bookkeeping around them.
 
 use std::time::Duration;
@@ -7,7 +7,7 @@ use crate::config::{Account, Binding, Config, Provider, SurfaceKind};
 use crate::error::{Error, Result};
 use crate::locks::{lock_accounts, AccountLock};
 use crate::paths::Paths;
-use crate::state::{now_secs, State, SwitchRecord, QUARANTINE_LIMIT};
+use crate::state::{now_secs, State, QUARANTINE_LIMIT};
 use crate::surface::{Env, Surface};
 use crate::vault::{Slot, Vault};
 
@@ -45,32 +45,6 @@ pub fn activate(env: &Env, config: &Config, surface: &dyn Surface, target: &str)
         }
         s.record_switch(kind, target, now_secs());
     })
-}
-
-/// The journal entry `undo` would act on.
-pub fn undo_record(paths: &Paths, kind: Option<SurfaceKind>) -> Result<SwitchRecord> {
-    State::load(paths)?.undo_target(kind).cloned().ok_or_else(|| Error::NotFound("a switch to undo".into()))
-}
-
-/// Re-activate the previous account of the newest switch on `surface`, from its current vault slot, and make
-/// it the surface's first priority (an undo is a manual choice). Returns the restored account id.
-pub fn undo(env: &Env, config: &Config, surface: &dyn Surface) -> Result<String> {
-    let kind = surface.kind();
-    let record = undo_record(env.paths, Some(kind))?;
-    let previous = record.previous_account_id.clone().ok_or_else(|| {
-        Error::Invalid(format!("`{kind}` had no known account before the last switch, so there is nothing to restore"))
-    })?;
-    let account = checked_account(config, kind, &previous)
-        .map_err(|e| Error::Invalid(format!("cannot undo: {e}")))?;
-
-    let ids = [previous.as_str(), record.new_account_id.as_str()];
-    let _locks = lock_accounts(env.paths, &ids, LOCK_TIMEOUT)?;
-    let mut staged = surface.stage(env, account)?;
-    staged.held = ids.iter().map(|id| id.to_string()).collect();
-    surface.apply(env, staged)?;
-    State::update(env.paths, |s| s.complete_undo(kind))?;
-    promote(env.paths, kind, &previous)?;
-    Ok(previous)
 }
 
 /// Change the binding in `config.toml`. Activation is a separate step so a failed activation never
@@ -254,13 +228,9 @@ mod tests {
         let s = Fake::new(SurfaceKind::ClaudeCli);
         activate(&env, &f.config, &s, "personal").unwrap();
         activate(&env, &f.config, &s, "team").unwrap();
-        undo(&env, &f.config, &s).unwrap();
         let held = s.held.lock().unwrap();
         assert_eq!(held[0], ["personal"]);
         assert_eq!(held[1], ["team", "personal"]);
-        let mut undone = held[2].clone();
-        undone.sort();
-        assert_eq!(undone, ["personal", "team"]);
     }
 
     #[test]
@@ -295,50 +265,6 @@ mod tests {
         assert!(activate(&env, &f.config, &s, "gpt").is_err());
         assert!(activate(&env, &f.config, &s, "ghost").is_err());
         assert!(s.applied.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn undo_restores_the_previous_account_from_its_current_slot_not_a_stale_copy() {
-        let f = fixture();
-        let env = Env { paths: &f.paths, vault: &f.vault };
-        let s = Fake::new(SurfaceKind::ClaudeCli);
-        activate(&env, &f.config, &s, "personal").unwrap();
-        activate(&env, &f.config, &s, "team").unwrap();
-        // While `team` was active, `personal` was refreshed elsewhere: its refresh token rotated.
-        f.vault.put("personal", "claude-oauth", &slot(r#"{"owner":"personal","gen":2}"#)).unwrap();
-
-        let restored = undo(&env, &f.config, &s).unwrap();
-        assert_eq!(restored, "personal");
-        let applied = s.applied.lock().unwrap();
-        let (id, payload) = applied.last().unwrap();
-        assert_eq!(id, "personal");
-        assert!(payload.contains(r#""gen":2"#), "undo must use the refreshed slot, got {payload}");
-        let st = State::load(&f.paths).unwrap();
-        assert_eq!(st.active(SurfaceKind::ClaudeCli), Some("personal"));
-        assert_eq!(st.journal.len(), 1);
-    }
-
-    #[test]
-    fn undo_with_nothing_to_restore_is_a_clear_error() {
-        let f = fixture();
-        let env = Env { paths: &f.paths, vault: &f.vault };
-        let s = Fake::new(SurfaceKind::ClaudeCli);
-        assert!(matches!(undo(&env, &f.config, &s), Err(Error::NotFound(_))));
-        activate(&env, &f.config, &s, "personal").unwrap(); // first ever switch: no previous
-        let err = undo(&env, &f.config, &s).unwrap_err();
-        assert!(err.to_string().contains("nothing to restore"), "{err}");
-    }
-
-    #[test]
-    fn undo_fails_when_the_previous_account_was_removed() {
-        let f = fixture();
-        let env = Env { paths: &f.paths, vault: &f.vault };
-        let s = Fake::new(SurfaceKind::ClaudeCli);
-        activate(&env, &f.config, &s, "personal").unwrap();
-        activate(&env, &f.config, &s, "team").unwrap();
-        let mut config = f.config.clone();
-        config.remove_account("personal").unwrap();
-        assert!(undo(&env, &config, &s).is_err());
     }
 
     #[test]
@@ -387,17 +313,6 @@ mod tests {
         // A plain bind (the rollback after a failed switch) leaves the priority alone.
         bind(&f.paths, SurfaceKind::ClaudeCli, Binding::parse("personal")).unwrap();
         assert_eq!(Config::load(&f.paths).unwrap().priority.claude_cli, ["team", "personal"]);
-    }
-
-    #[test]
-    fn undo_makes_the_restored_account_the_first_priority() {
-        let f = fixture();
-        let env = Env { paths: &f.paths, vault: &f.vault };
-        let s = Fake::new(SurfaceKind::ClaudeCli);
-        activate(&env, &f.config, &s, "team").unwrap();
-        activate(&env, &f.config, &s, "personal").unwrap();
-        assert_eq!(undo(&env, &f.config, &s).unwrap(), "team");
-        assert_eq!(Config::load(&f.paths).unwrap().priority(SurfaceKind::ClaudeCli), ["team", "personal"]);
     }
 
     #[test]

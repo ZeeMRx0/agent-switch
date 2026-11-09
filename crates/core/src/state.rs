@@ -2,9 +2,7 @@
 //!
 //! The binding (the user's choice) lives in `config.toml`. This file holds what is true right now: the
 //! **active** account per surface, any **pending** record (a switch or rejoin that still needs a click),
-//! and a short journal that powers `undo`. A journal entry names accounts by id only. `undo` re-activates
-//! the previous account from its *current* vault slot, never from a stored copy of its token, because that
-//! copy may have been spent by a refresh in between.
+//! and a short journal of completed switches. A journal entry names accounts by id only, never a token.
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -250,7 +248,7 @@ impl State {
         self.surfaces.iter().filter(|(_, s)| s.active.as_deref() == Some(account_id)).map(|(k, _)| *k).collect()
     }
 
-    /// Record a completed switch: the new account becomes active and the change becomes undoable.
+    /// Record a completed switch: the new account becomes active and the switch is journaled.
     pub fn record_switch(&mut self, kind: SurfaceKind, new_account_id: &str, at: u64) {
         let previous = self.active(kind).map(str::to_string);
         self.set_active(kind, Some(new_account_id.to_string()));
@@ -269,19 +267,6 @@ impl State {
         if self.journal.len() > JOURNAL_LIMIT {
             let excess = self.journal.len() - JOURNAL_LIMIT;
             self.journal.drain(..excess);
-        }
-    }
-
-    /// The newest journal entry for `kind`, or the newest overall when `kind` is `None`.
-    pub fn undo_target(&self, kind: Option<SurfaceKind>) -> Option<&SwitchRecord> {
-        self.journal.iter().rev().find(|r| kind.is_none_or(|k| r.surface == k))
-    }
-
-    /// Finish an undo: the previous account is active again and the entry is consumed.
-    pub fn complete_undo(&mut self, kind: SurfaceKind) {
-        if let Some(idx) = self.journal.iter().rposition(|r| r.surface == kind) {
-            let rec = self.journal.remove(idx);
-            self.set_active(kind, rec.previous_account_id);
         }
     }
 
@@ -318,7 +303,7 @@ mod tests {
         s.record_switch(SurfaceKind::ClaudeCli, "personal", 1);
         s.record_switch(SurfaceKind::ClaudeCli, "team", 2);
         assert_eq!(s.active(SurfaceKind::ClaudeCli), Some("team"));
-        let r = s.undo_target(Some(SurfaceKind::ClaudeCli)).unwrap();
+        let r = s.journal.last().unwrap();
         assert_eq!(r.previous_account_id.as_deref(), Some("personal"));
         assert_eq!(r.new_account_id, "team");
     }
@@ -341,26 +326,10 @@ mod tests {
     }
 
     #[test]
-    fn complete_undo_restores_previous_and_consumes_the_entry() {
-        let mut s = State::default();
-        s.record_switch(SurfaceKind::ClaudeCli, "personal", 1);
-        s.record_switch(SurfaceKind::ClaudeCli, "team", 2);
-        s.record_switch(SurfaceKind::CodexCli, "gpt", 3);
-        s.complete_undo(SurfaceKind::ClaudeCli);
-        assert_eq!(s.active(SurfaceKind::ClaudeCli), Some("personal"));
-        assert_eq!(s.active(SurfaceKind::CodexCli), Some("gpt"));
-        // The next undo for claude-cli targets the first switch; the codex entry is untouched.
-        assert_eq!(s.undo_target(Some(SurfaceKind::ClaudeCli)).unwrap().new_account_id, "personal");
-        assert_eq!(s.undo_target(None).unwrap().surface, SurfaceKind::CodexCli);
-    }
-
-    #[test]
     fn first_ever_switch_has_no_previous() {
         let mut s = State::default();
         s.record_switch(SurfaceKind::ClaudeCli, "personal", 1);
-        assert_eq!(s.undo_target(None).unwrap().previous_account_id, None);
-        s.complete_undo(SurfaceKind::ClaudeCli);
-        assert_eq!(s.active(SurfaceKind::ClaudeCli), None);
+        assert_eq!(s.journal.last().unwrap().previous_account_id, None);
     }
 
     #[test]

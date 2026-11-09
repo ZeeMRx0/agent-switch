@@ -26,6 +26,9 @@ pub fn switch_note(kind: SurfaceKind) -> Option<&'static str> {
         SurfaceKind::CodexCli => Some(
             "note: a Codex session that is already running keeps its login; the new account applies to sessions started from now on.",
         ),
+        SurfaceKind::AntigravityCli => Some(
+            "note: start a new `agy` session to use the new account; a session that is already running may keep the old one.",
+        ),
         _ => None,
     }
 }

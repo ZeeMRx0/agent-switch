@@ -372,7 +372,7 @@ pub fn decide(config: &Config, state: &State, now: u64) -> Vec<Decision> {
 /// Providers whose every account has a stale (or no) reading while at least one surface of that provider is
 /// managed with auto-switch on: auto mode cannot decide anything for them and pauses.
 pub fn paused_providers(config: &Config, state: &State, now: u64) -> Vec<Provider> {
-    [Provider::Claude, Provider::Openai]
+    Provider::ALL
         .into_iter()
         .filter(|p| {
             SurfaceKind::ALL.into_iter().any(|k| k.provider() == *p && config.surfaces.get(k).account_id().is_some() && config.auto.enabled_for(k))
@@ -654,6 +654,34 @@ mod tests {
         assert_eq!(paused_providers(&w.config, &w.state, T0), vec![Provider::Claude]);
         w.config.auto.set_enabled_for(SurfaceKind::ClaudeDesktop, false);
         assert!(paused_providers(&w.config, &w.state, T0).is_empty());
+    }
+
+    #[test]
+    fn the_antigravity_cli_switches_down_its_own_priority_returns_and_pauses_on_its_own() {
+        let mut w = world();
+        for id in ["g1", "g2", "g3"] {
+            w.config.add_account(acct(id, Provider::Antigravity)).unwrap();
+            w.state.usage.insert(id.into(), rec(10.0, 10.0));
+        }
+        w.config.bind(SurfaceKind::AntigravityCli, Binding::parse("g2")).unwrap();
+        w.config.priority.antigravity_cli = vec!["g2".into(), "g3".into(), "g1".into()];
+        w.state.set_active(SurfaceKind::AntigravityCli, Some("g2".into()));
+        let agy = |w: &World| decide(&w.config, &w.state, T0).into_iter().find(|d| d.surface == SurfaceKind::AntigravityCli).unwrap().outcome;
+        assert_eq!(agy(&w), Outcome::Hold(Hold::NoTrigger));
+        w.state.usage.insert("g2".into(), rec(10.0, 95.0));
+        assert_eq!(agy(&w), Outcome::Switch { from: "g2".into(), candidates: vec!["g3".into(), "g1".into()], split: false, back: false });
+        // On g3, once g2 has room again, it goes back up.
+        w.state.set_active(SurfaceKind::AntigravityCli, Some("g3".into()));
+        w.state.last_auto_switch.insert(SurfaceKind::AntigravityCli, T0 - 300);
+        w.state.usage.insert("g2".into(), rec(10.0, 40.0));
+        assert_eq!(agy(&w), Outcome::Switch { from: "g3".into(), candidates: vec!["g2".into()], split: false, back: true });
+        w.config.auto.set_enabled_for(SurfaceKind::AntigravityCli, false);
+        assert_eq!(agy(&w), Outcome::Hold(Hold::AutoOff));
+        w.config.auto.set_enabled_for(SurfaceKind::AntigravityCli, true);
+        for id in ["g1", "g2", "g3"] {
+            w.state.usage.get_mut(id).unwrap().fetched_at = Some(T0 - STALE_AFTER_S - 5);
+        }
+        assert_eq!(paused_providers(&w.config, &w.state, T0), vec![Provider::Antigravity]);
     }
 
     /// The Claude CLI on b, below its line, after a switch away from a long enough ago.

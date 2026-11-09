@@ -1,6 +1,6 @@
 # agent-switch
 
-A Rust CLI and a macOS menu bar app that switch Claude and ChatGPT accounts per surface, keep your history and settings in place, and can switch by itself when an account nears its usage limit.
+A Rust CLI and a macOS menu bar app that switch Claude, ChatGPT and Antigravity accounts per surface, keep your history and settings in place, and can switch by itself when an account nears its usage limit.
 
 | Surface | What a switch does |
 |---|---|
@@ -8,6 +8,7 @@ A Rust CLI and a macOS menu bar app that switch Claude and ChatGPT accounts per 
 | `claude-desktop` | One Claude Desktop profile folder per account. A switch quits the app, then reopens it on the target profile. |
 | `chatgpt-desktop` (ChatGPT app) | Quits the app, saves the login back, swaps `~/.codex/auth.json`, reopens. |
 | `codex-cli` | Its own `CODEX_HOME` (a "shallow home": links to `~/.codex` plus its own `auth.json`), or the same swap as the app when bound with it. |
+| `antigravity-cli` (`agy`) | Saves the current login back, then swaps the login in the Keychain item `gemini` / `antigravity`. New `agy` sessions use the new account. |
 
 Each surface is bound to an account or left `unmanaged`. A switch touches only the surfaces you bound. macOS only. Design, mechanics and test evidence are in [docs/architecture.md](docs/architecture.md).
 
@@ -71,18 +72,20 @@ agent-switch add openai --id team-openai --from-file ~/.codex/auth.json [--from-
 # Claude Desktop: sign in on a new profile (waits up to 10 minutes) or register an existing profile folder
 agent-switch add claude-desktop team-claude
 agent-switch add claude-desktop team-claude --from-profile <profile dir>
+
+# Antigravity CLI: sign in with `agy` first, then save that login
+agent-switch add antigravity-cli --id work-agy [--label Work]
 ```
 
 Claude Desktop's own folder is registered in place and protected from removal. Any other `--from-profile` folder is cloned (APFS copy-on-write) into the managed folder. MCP `env` values in the Desktop config are copied as is; the command lists the key names.
 
-### Bind, switch, undo
+### Bind and switch
 
 ```sh
 agent-switch bind claude-cli personal-claude      # set the binding and activate it
 agent-switch bind codex-cli unmanaged             # stop managing a surface
 agent-switch switch claude-cli team-claude        # one-off activation, binding unchanged
 agent-switch switch claude-desktop team-claude --restart   # --restart consents to quitting the app
-agent-switch undo [surface]                       # re-activate the previous account from its current saved login
 agent-switch remove <account>                     # refused while the account is bound or active
 ```
 
@@ -100,7 +103,7 @@ Desktop keeps the Code-tab session list per profile, so a new account used to op
 
 ### Auto mode
 
-Auto-switching runs inside the menu bar app (one watcher at a time). Each provider section of the menu has a `CLI: <account>` and a `Desktop: <account>` submenu. In each one you pick the account (or "Leave unmanaged"), turn auto-switch on or off for that surface, and set the order in which auto-switch uses the accounts ("Priority", with "Move up" and "Move down"). The account rows above them only show which surfaces use each account and its usage.
+Auto-switching runs inside the menu bar app (one watcher at a time). Each provider section of the menu has a `CLI: <account>` and a `Desktop: <account>` submenu (Antigravity has only the CLI one). In each one you pick the account (or "Leave unmanaged"), turn auto-switch on or off for that surface, and set the order in which auto-switch uses the accounts ("Priority", with "Move up" and "Move down"). The account rows above them only show which surfaces use each account and its usage. An "Add account…" item at the end of each provider section opens Terminal and runs the matching `agent-switch add` command (for Antigravity, sign in with `agy` first; the window asks for an account id).
 
 The same settings live in `~/.config/agent-switch/config.toml`:
 
@@ -118,18 +121,19 @@ claude-cli = true
 claude-desktop = false
 codex-cli = true
 chatgpt-desktop = true
+antigravity-cli = true
 
 [priority]               # optional; per surface, account ids, highest first
 claude-cli = ["team-claude", "personal-claude"]
 ```
 
 - A surface without a `[priority]` list puts its bound account first, then the other accounts in file order, so an older config file never makes a surface move away from its binding. Accounts missing from a list come after the listed ones, in file order, and unknown ids are ignored. Removing an account removes it from every list.
-- Choosing an account by hand makes it the surface's first priority. This covers picking it in the menu, `agent-switch bind`, `agent-switch switch` and "Undo". A Desktop pick that is refused (the binding goes back) changes nothing; one that switched the app keeps the binding and the priority even if the app then fails to come up.
-- Without `[auto.surfaces]`, `enabled` applies to all four surfaces, so older config files keep working as before. The first per-surface toggle in the menu writes all four values.
+- Choosing an account by hand makes it the surface's first priority. This covers picking it in the menu, `agent-switch bind` and `agent-switch switch`. A Desktop pick that is refused (the binding goes back) changes nothing; one that switched the app keeps the binding and the priority even if the app then fails to come up.
+- Without `[auto.surfaces]`, `enabled` applies to every surface, so older config files keep working as before. The first per-surface toggle in the menu writes a value for each surface; a surface missing from the table follows `enabled`.
 - When the current account reaches the threshold, the surface moves to the first account in its priority order that has room.
 - When the current account is below the threshold, the cooldown has passed and no switch-needed event is waiting, the surface moves back to a higher-priority account. That account needs a usage reading from the last 30 minutes with both windows below `threshold - hysteresis`. It also must not be dead, live on another surface that holds its login, or the target of another surface's waiting switch-needed event. A Codex CLI that shares `~/.codex` with the ChatGPT app never splits off to return; the app's event moves both.
 - A return needs that fresh reading of the higher-priority account. With `refresh_inactive = false`, an idle account whose saved login has expired may not get a new reading, so a return can be delayed until you switch to it or turn `refresh_inactive` on.
-- CLI surfaces (`claude-cli`, `codex-cli`) switch automatically. Desktop surfaces raise a notification with a "Relaunch" button, both to move on and to move back; nothing quits until you click.
+- CLI surfaces (`claude-cli`, `codex-cli`, `antigravity-cli`) switch automatically. Desktop surfaces raise a notification with a "Relaunch" button, both to move on and to move back; nothing quits until you click.
 - `codex_cli_mode`: `new-sessions` switches the login now and running Codex sessions keep the old account until restarted; `notify` never switches automatically and offers a button; `force` switches now even if a running session then hits a sign-in error.
 - Accounts that are exhausted or have a dead login are skipped. By default a saved login is refreshed only just before you switch to it.
 
@@ -149,7 +153,7 @@ agent-switch default-link disable       # put the real folder back
 - **Server-side chats do not move.** Conversations that live on a provider's servers (claude.ai, ChatGPT web history) belong to the account that created them. Local Claude Code projects and Codex sessions stay shared.
 - **Never run `/logout`** in Claude Code or `codex logout` on a managed surface. That revokes the login that the vault also holds, and the saved copy stops working. Use `agent-switch switch` or `bind` instead.
 - **Terms of service.** Refreshing OAuth logins outside the official clients is an area that Anthropic's policy for third-party use of subscription OAuth addresses. `refresh_inactive` is off by default for that reason: by default agent-switch refreshes a saved login only just before switching to it, and never the active login (the official client owns it). Read the current terms of your plan and decide.
-- **Undocumented endpoints.** Usage comes from `api/oauth/usage` (Claude) and `backend-api/wham/usage` (ChatGPT). If they change, `list` shows the last-known values with their age and auto mode pauses.
+- **Undocumented endpoints.** Usage comes from `api/oauth/usage` (Claude), `backend-api/wham/usage` (ChatGPT) and `v1internal:fetchAvailableModels` (Antigravity, per-model quota mapped to the two windows). If they change, `list` shows the last-known values with their age and auto mode pauses.
 - **Claude login size.** `/usr/bin/security` accepts about 4 KB. The live Claude login with many MCP logins can exceed that; switches then refuse (fail closed) until you remove unused MCP logins. The signed helper has no such limit.
 - **Time Machine and APFS snapshots keep deleted plaintext.** Removing an old `auth.json` or backup does not remove it from earlier backups or local snapshots. Exclude `~/.agent-switch` from Time Machine (`tmutil addexclusion ~/.agent-switch`), and consider logging in to each account once after migration so the old copies are invalid.
 - **Stored secrets.** Logins live in the Keychain. Live auth files (`~/.codex/auth.json`, the shallow home's `auth.json`) are mode `0600`. No token appears in command arguments or logs; emails are masked in output.

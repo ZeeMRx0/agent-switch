@@ -1,3 +1,4 @@
+mod antigravity_add;
 mod claude_add;
 mod codex_commands;
 mod commands;
@@ -8,7 +9,7 @@ mod registry;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "agent-switch", version, about = "Switch Claude and ChatGPT accounts per surface")]
+#[command(name = "agent-switch", version, about = "Switch Claude, ChatGPT and Antigravity accounts per surface")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -26,7 +27,7 @@ enum Command {
     },
     /// Activate an account on a bound surface (one-off; does not change the binding)
     Switch {
-        /// claude-cli, claude-desktop, codex-cli or chatgpt-desktop
+        /// claude-cli, claude-desktop, codex-cli, chatgpt-desktop or antigravity-cli
         surface: String,
         account: String,
         /// Also restart the app (Desktop surfaces)
@@ -35,11 +36,6 @@ enum Command {
         /// Desktop: switch even if a session is mid-reply; that reply is lost
         #[arg(long)]
         force: bool,
-    },
-    /// Re-activate the previous account of the last switch, from its current saved login
-    Undo {
-        /// Limit to one surface; default is the most recent switch
-        surface: Option<String>,
     },
     /// Log in a new account on a surface and save it
     Add {
@@ -112,7 +108,6 @@ fn main() {
         Command::Status => commands::status(),
         Command::List { json } => list_command::list(json),
         Command::Switch { surface, account, restart, force } => commands::switch(&surface, &account, restart, force),
-        Command::Undo { surface } => commands::undo(surface.as_deref()),
         Command::Add { surface, account, id, label, from_keychain_item, config_dir, from_file, from_profile, dry_run } => commands::add(
             &surface,
             commands::AddOptions { account, id, label, from_keychain_item, config_dir, from_file, from_profile, dry_run },

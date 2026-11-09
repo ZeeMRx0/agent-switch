@@ -247,7 +247,8 @@ fn jwt_claims(jwt: &str) -> Result<serde_json::Value> {
     serde_json::from_slice(&bytes).map_err(|_| Error::Invalid("id_token payload is not JSON".into()))
 }
 
-fn b64url_decode(s: &str) -> Option<Vec<u8>> {
+/// Decode base64 in either alphabet (standard or URL-safe), with or without padding.
+pub(crate) fn b64url_decode(s: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(s.len() * 3 / 4);
     let (mut acc, mut bits) = (0u32, 0u32);
     for c in s.trim_end_matches('=').bytes() {

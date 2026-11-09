@@ -1,6 +1,6 @@
 //! The adapter boundary. Each surface (Claude Code CLI, Claude Desktop, Codex CLI, ChatGPT Desktop) and any
 //! future provider implements `Surface` with its own paths. Usage is a separate seam: a new provider
-//! implements `usage::ProviderApi` and gets a `Provider` arm in `LiveApi`. Config, vault, locks and undo
+//! implements `usage::ProviderApi` and gets a `Provider` arm in `LiveApi`. Config, vault and locks
 //! stay unchanged.
 
 use std::fmt;
@@ -34,7 +34,7 @@ pub struct Identity {
 pub struct Staged {
     pub account_id: String,
     pub payload: Vec<u8>,
-    /// Account ids whose account locks the caller (`switch::activate`, `undo`) holds while `apply` runs.
+    /// Account ids whose account locks the caller (`switch::activate`) holds while `apply` runs.
     /// `apply` must not lock these again (a second `flock` on another file description would wait for the
     /// first), and must lock any other account it writes to.
     pub held: Vec<String>,

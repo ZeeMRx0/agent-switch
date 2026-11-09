@@ -248,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn undo_restores_the_previous_cli_account_from_its_current_slot() {
+    fn switching_back_restores_the_previous_cli_account_from_its_current_slot() {
         let (f, _cfg, _team, _) = split();
         crate::adapters::codex::import(
             &f.env(),
@@ -263,7 +263,8 @@ mod tests {
         switch::activate(&f.env(), &cfg, &CodexCli, "personal").unwrap();
         cfg.bind(SurfaceKind::CodexCli, Binding::parse("other")).unwrap();
         switch::activate(&f.env(), &cfg, &CodexCli, "other").unwrap();
-        assert_eq!(switch::undo(&f.env(), &cfg, &CodexCli).unwrap(), "personal");
+        cfg.bind(SurfaceKind::CodexCli, Binding::parse("personal")).unwrap();
+        switch::activate(&f.env(), &cfg, &CodexCli, "personal").unwrap();
         assert_eq!(read_copy(&f.homes.shallow, "x").unwrap().unwrap().login.account_id, "acct-me");
     }
 }

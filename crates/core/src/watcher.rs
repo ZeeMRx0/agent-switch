@@ -543,7 +543,7 @@ impl<'a> Watcher<'a> {
             if s.pending(kind).is_some_and(|q| q.id == event_id) {
                 s.set_pending(kind, None);
             }
-            // Only the app's switch is undoable: undoing the CLI alone would not change the shared files.
+            // Only the app's switch is journaled; the CLI follows it through the shared files.
             if moves_cli {
                 s.set_active(SurfaceKind::CodexCli, Some(target.id.clone()));
             }
@@ -1146,8 +1146,8 @@ mod tests {
         });
         let st = State::load(&r.f.paths).unwrap();
         assert_eq!((st.active(SurfaceKind::ChatgptDesktop), st.active(SurfaceKind::CodexCli)), (Some("x"), Some("x")));
-        assert_eq!(st.undo_target(None).unwrap().surface, SurfaceKind::ChatgptDesktop, "Undo moves the app, which takes the CLI along");
-        assert!(st.undo_target(Some(SurfaceKind::CodexCli)).is_none());
+        assert_eq!(st.journal.last().unwrap().surface, SurfaceKind::ChatgptDesktop, "only the app's move is journaled");
+        assert!(st.journal.iter().all(|r| r.surface != SurfaceKind::CodexCli));
         assert!(!st.codex_split());
     }
 

@@ -11,6 +11,8 @@ fn run(home: &Path, args: &[&str]) -> Output {
         .args(args)
         .env("HOME", home)
         .env("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/nonexistent/agent-switch-test")
+        .env("AGENT_SWITCH_ANTIGRAVITY_SERVICE", "agent-switch-test-nonexistent")
+        .env("PATH", "/usr/bin:/bin")
         .output()
         .expect("run agent-switch")
 }

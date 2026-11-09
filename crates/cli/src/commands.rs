@@ -124,21 +124,6 @@ pub fn switch(surface: &str, account: &str, restart: bool, force: bool) -> Resul
     Ok(0)
 }
 
-pub fn undo(surface: Option<&str>) -> Result<Code> {
-    let app = App::open()?;
-    let config = Config::load(&app.paths)?;
-    let kind = match surface {
-        Some(s) => s.parse()?,
-        None => switch::undo_record(&app.paths, None)?.surface,
-    };
-    let restored = switch::undo(&app.env(), &config, surface_for(kind).as_ref())?;
-    println!("{kind}: restored {restored}");
-    if let Some(note) = switch_note(kind) {
-        println!("{note}");
-    }
-    Ok(0)
-}
-
 /// Options of `agent-switch add`. Each surface reads the ones it understands.
 pub struct AddOptions {
     /// The account for `add claude-desktop <account>`.
@@ -161,6 +146,7 @@ pub fn add(surface: &str, opts: AddOptions) -> Result<Code> {
         SurfaceKind::ClaudeCli => crate::claude_add::run(&opts),
         SurfaceKind::CodexCli | SurfaceKind::ChatgptDesktop => crate::codex_commands::add(&opts),
         SurfaceKind::ClaudeDesktop => crate::desktop_commands::add(&opts),
+        SurfaceKind::AntigravityCli => crate::antigravity_add::run(&opts),
     }
 }
 
@@ -219,6 +205,7 @@ pub fn doctor() -> Result<Code> {
         checks.retain(|c| !(c.name == "app versions" && c.level == Level::Skip));
     }
     checks.extend(claude_desktop::doctor_checks(&app.env()));
+    checks.extend(agent_switch_core::adapters::antigravity_cli::AntigravityCli::production().doctor_checks(&app.env()));
     let mut failed = false;
     for c in &checks {
         let tag = match c.level {
