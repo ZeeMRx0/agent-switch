@@ -235,6 +235,10 @@ impl App {
         if !menu::should_rebuild(&entries, &self.shown, self.force_rebuild) {
             return;
         }
+        // Replacing the menu while it is open closes it under the pointer. Wait; the ticker tries again.
+        if menu_is_open() {
+            return;
+        }
         match menu::render(&entries) {
             Ok(rendered) => {
                 if let Some(tray) = &self.tray {
@@ -369,4 +373,11 @@ fn run_notify_test() -> i32 {
             _ => {}
         }
     })
+}
+
+/// Whether a menu of this app is open. While AppKit tracks an open menu, the main run loop runs in
+/// `NSEventTrackingRunLoopMode`; this app has no windows, so only its tray menu can put it there.
+fn menu_is_open() -> bool {
+    let mode = objc2_foundation::NSRunLoop::currentRunLoop().currentMode();
+    mode.is_some_and(|m| m.to_string() == "NSEventTrackingRunLoopMode")
 }
