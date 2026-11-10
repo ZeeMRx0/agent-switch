@@ -61,6 +61,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$OUT_DIR/agent-switch-menubar" "$APP/Contents/MacOS/agent-switch-menubar"
 # The Keychain helper sits beside the executable, where the core looks for it.
 cp "$OUT_DIR/agent-switch-keychain" "$APP/Contents/MacOS/agent-switch-keychain"
+cp crates/menubar/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 sed "s/__VERSION__/$VERSION/g" crates/menubar/Info.plist > "$APP/Contents/Info.plist"
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
 
