@@ -21,7 +21,7 @@ use agent_switch_core::adapters::surface_for;
 use agent_switch_core::config::{Binding, Config, SurfaceKind};
 use agent_switch_core::macos_apps::SystemApps;
 use agent_switch_core::paths::Paths;
-use agent_switch_core::signing::detect_keychain;
+use agent_switch_core::security_cli::SecurityCli;
 use agent_switch_core::state::now_secs;
 use agent_switch_core::surface::{Env, Surface};
 use agent_switch_core::usage::LiveApi;
@@ -125,8 +125,7 @@ fn consenting_surface(kind: SurfaceKind) -> Box<dyn Surface> {
 fn run(report: Arc<dyn Fn(Report) + Send + Sync>, rx: mpsc::Receiver<Cmd>, ready: Sender<std::result::Result<(), StartError>>) {
     let setup = || -> Result<(Paths, Vault)> {
         let paths = Paths::from_env()?;
-        let exe = std::env::current_exe().map_err(|e| Error::io("find the running executable", e))?;
-        Ok((paths, Vault::new(Arc::from(detect_keychain(&exe)))))
+        Ok((paths, Vault::new(Arc::new(SecurityCli::default()))))
     };
     let (paths, vault) = match setup() {
         Ok(v) => v,

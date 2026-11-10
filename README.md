@@ -32,8 +32,6 @@ The vault keeps logins in the Keychain through `/usr/bin/security`. A login larg
 
 The Homebrew install removes `~/Applications/AgentSwitch.app` and `~/.local/bin/agent-switch` for you, after the new build succeeds. If the old app is running, the install stops and asks you to quit it from its menu. Run the command again after that. Your saved accounts stay in the vault.
 
-If you installed with `scripts/install.sh --signed`, the install stops with a message. A signed install keeps its logins in a different vault. Remove `~/.local/bin/agent-switch` and `~/.local/bin/agent-switch-keychain` after you save your accounts, then run the command again. You add your accounts again afterwards.
-
 ### Coming from the Homebrew formula
 
 An earlier release came as a Homebrew formula. Remove it first, then install the cask:
@@ -51,23 +49,7 @@ To build and install from a checkout without Homebrew:
 scripts/install.sh
 ```
 
-This needs no certificate. It needs a Rust toolchain (`rustup`) and the Xcode command line tools. A local install refuses while the Homebrew cask is installed. It builds in release mode, copies `agent-switch` to `~/.local/bin` (make sure that folder is on `PATH`) and installs an ad-hoc signed `Agent Switch.app` to `~/Applications`. It also removes a legacy `AgentSwitch.app`. `--adhoc` is accepted as an alias of the default.
-
-#### Signed install (optional)
-
-```sh
-scripts/install.sh --signed
-```
-
-A signed install uses a stable local identity. Its benefits are that the vault goes through the `SecItem` helper `agent-switch-keychain` (placed beside the CLI), and that the app keeps its notification permission across reinstalls.
-
-Create the certificate once:
-
-1. Open Keychain Access, then Certificate Assistant, then Create a Certificate.
-2. Name: `agent-switch Code Signing`. Identity Type: Self Signed Root. Certificate Type: Code Signing. Create it.
-3. Check it with `security find-identity -p codesigning`. The first signing run may ask to use the private key: choose Always Allow.
-
-The signed helper opens a different vault than `/usr/bin/security` does, so logins saved with one install type are invisible to the other. Switching between the two means adding your accounts again. `scripts/install.sh --signed` refuses to install over an existing `/usr/bin/security` vault unless you pass `--allow-vault-backend-change`, and the default install refuses when `agent-switch-keychain` is already installed beside the CLI.
+This needs no certificate. It needs a Rust toolchain (`rustup`) and the Xcode command line tools. A local install refuses while the Homebrew cask is installed. It builds in release mode, copies `agent-switch` to `~/.local/bin` (make sure that folder is on `PATH`) and installs an ad-hoc signed `Agent Switch.app` to `~/Applications`. It also removes a legacy `AgentSwitch.app`.
 
 Open the app with `open "$HOME/Applications/Agent Switch.app"` and answer the notification prompt. Quit it from its menu before you reinstall.
 
@@ -188,7 +170,7 @@ agent-switch default-link disable       # put the real folder back
 - **Never run `/logout`** in Claude Code or `codex logout` on a managed surface. That revokes the login that the vault also holds, and the saved copy stops working. Use `agent-switch switch` or `bind` instead.
 - **Terms of service.** Refreshing OAuth logins outside the official clients is an area that Anthropic's policy for third-party use of subscription OAuth addresses. `refresh_inactive` is off by default for that reason: by default agent-switch refreshes a saved login only just before switching to it, and never the active login (the official client owns it). Read the current terms of your plan and decide.
 - **Undocumented endpoints.** Usage comes from `api/oauth/usage` (Claude), `backend-api/wham/usage` (ChatGPT) and `v1internal:fetchAvailableModels` (Antigravity, per-model quota mapped to the two windows). If they change, `list` shows the last-known values with their age and auto mode pauses.
-- **Claude login size.** The vault splits large logins in both install types. Claude Code's own `Claude Code-credentials` item is always written through `/usr/bin/security`, which accepts about 4 KB. The live Claude login with many MCP logins can exceed that; switches then refuse (fail closed) until you remove unused MCP logins, in both install types.
+- **Claude login size.** The vault splits large logins into parts. Claude Code's own `Claude Code-credentials` item is always written through `/usr/bin/security`, which accepts about 4 KB. The live Claude login with many MCP logins can exceed that; switches then refuse (fail closed) until you remove unused MCP logins.
 - **Time Machine and APFS snapshots keep deleted plaintext.** Removing an old `auth.json` or backup does not remove it from earlier backups or local snapshots. Exclude `~/.agent-switch` from Time Machine (`tmutil addexclusion ~/.agent-switch`), and consider logging in to each account once after migration so the old copies are invalid.
 - **Stored secrets.** Logins live in the Keychain. Live auth files (`~/.codex/auth.json`, the shallow home's `auth.json`) are mode `0600`. No token appears in command arguments or logs; emails are masked in output.
 
@@ -205,7 +187,7 @@ cargo clippy --workspace --all-targets
 agent-switch-menubar --print-menu # render the menu as text without a GUI
 ```
 
-Workspace crates: `core` (vault, adapters, policy, watcher), `cli`, `menubar`, `keychain-helper`.
+Workspace crates: `core` (vault, adapters, policy, watcher), `cli`, and `menubar`.
 
 ## Credits and license
 

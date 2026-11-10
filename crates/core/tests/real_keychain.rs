@@ -1,16 +1,14 @@
 //! Real-Keychain tests. Ignored by default because they touch the login keychain (throwaway items only,
 //! service `agent-switch-test-<pid>-<tag>`, always cleaned up). Run with:
 //!
-//!   cargo build -p agent-switch-keychain && cargo test -p agent-switch-core --test real_keychain -- --ignored
+//!   cargo test -p agent-switch-core --test real_keychain -- --ignored
 //!
 //! While each write runs, the process list is sampled to prove the secret never appears in any argv.
 
-use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use agent_switch_core::helper_keychain::{HelperKeychain, HELPER_NAME};
 use agent_switch_core::keychain::Keychain;
 use agent_switch_core::security_cli::SecurityCli;
 use agent_switch_core::Error;
@@ -82,14 +80,6 @@ fn claude_blob(len: usize) -> String {
     format!("{head}{}{tail}", "A".repeat(pad))
 }
 
-fn helper_path() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let dir = exe.parent().unwrap().parent().unwrap();
-    let p = dir.join(HELPER_NAME);
-    assert!(p.is_file(), "compile the helper first: cargo build -p agent-switch-keychain ({})", p.display());
-    p
-}
-
 fn roundtrip_with_ps_sampling(kc: &dyn Keychain, tag: &str, len: usize) {
     let mut t = Throwaway::new(kc, tag);
     let acct = t.account("test:claude-oauth");
@@ -154,28 +144,4 @@ fn security_cli_replaces_an_existing_item_and_reports_missing() {
     assert_eq!(kc.get(&t.service, &acct).unwrap().as_deref(), Some("two"));
     assert!(kc.delete(&t.service, &acct).unwrap());
     assert!(!kc.delete(&t.service, &acct).unwrap());
-}
-
-#[test]
-#[ignore = "touches the login keychain; needs the compiled helper"]
-fn helper_carries_a_6kb_and_an_8kb_blob_without_argv() {
-    let kc = HelperKeychain::new(helper_path());
-    roundtrip_with_ps_sampling(&kc, "helper-6k", 6144);
-    roundtrip_with_ps_sampling(&kc, "helper-8k", 8192);
-}
-
-/// Items created by the helper trust the helper only: `/usr/bin/security` reading one would raise a
-/// Keychain prompt, so this suite deliberately never does that. The vault is read only through the helper.
-#[test]
-#[ignore = "touches the login keychain; needs the compiled helper"]
-fn helper_reports_missing_and_replaces_items() {
-    let helper = HelperKeychain::new(helper_path());
-    let mut t = Throwaway::new(&helper, "helper-basic");
-    let acct = t.account("x");
-    assert_eq!(helper.get(&t.service, &acct).unwrap(), None);
-    helper.set(&t.service, &acct, "one").unwrap();
-    helper.set(&t.service, &acct, "two").unwrap();
-    assert_eq!(helper.get(&t.service, &acct).unwrap().as_deref(), Some("two"));
-    assert!(helper.delete(&t.service, &acct).unwrap());
-    assert!(!helper.delete(&t.service, &acct).unwrap());
 }

@@ -6,7 +6,7 @@ use agent_switch_core::config::{mask_email, Binding, Config, SurfaceKind};
 use agent_switch_core::doctor::{self, DoctorInput, Level};
 use agent_switch_core::macos_apps::SystemApps;
 use agent_switch_core::paths::Paths;
-use agent_switch_core::signing::detect_keychain;
+use agent_switch_core::security_cli::SecurityCli;
 use agent_switch_core::state::State;
 use agent_switch_core::surface::{Env, Surface};
 use agent_switch_core::switch;
@@ -21,15 +21,13 @@ type Code = i32;
 pub(crate) struct App {
     pub(crate) paths: Paths,
     pub(crate) vault: Vault,
-    exe: PathBuf,
 }
 
 impl App {
     pub(crate) fn open() -> Result<App> {
         let paths = Paths::from_env()?;
-        let exe = std::env::current_exe().map_err(|e| Error::io("find the running executable", e))?;
-        let vault = Vault::new(Arc::from(detect_keychain(&exe)));
-        Ok(App { paths, vault, exe })
+        let vault = Vault::new(Arc::new(SecurityCli::default()));
+        Ok(App { paths, vault })
     }
 
     pub(crate) fn env(&self) -> Env<'_> {
@@ -193,7 +191,7 @@ pub fn bind(surface: &str, account: &str) -> Result<Code> {
 
 pub fn doctor() -> Result<Code> {
     let app = App::open()?;
-    let mut checks = doctor::run(&DoctorInput { paths: &app.paths, vault: &app.vault, exe: Some(&app.exe) });
+    let mut checks = doctor::run(&DoctorInput { paths: &app.paths, vault: &app.vault });
     // The core lists the Claude storage check as skipped; the adapter owns the real one.
     if let Some(at) = checks.iter().position(|c| c.name == "claude storage") {
         let real = agent_switch_core::adapters::claude_code::ClaudeCode::production().doctor_checks(&app.env());

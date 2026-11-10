@@ -1,4 +1,4 @@
-//! The Keychain backend boundary. Production uses `SecurityCli` or `HelperKeychain`; tests use `MemoryKeychain`.
+//! The Keychain backend boundary. Production uses `SecurityCli`; tests use `MemoryKeychain`.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
