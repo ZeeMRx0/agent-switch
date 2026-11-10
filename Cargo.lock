@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-switch-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "agent-switch-core",
  "clap",
@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "agent-switch-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "rustix",
  "serde",
@@ -35,14 +35,14 @@ dependencies = [
 
 [[package]]
 name = "agent-switch-keychain"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "security-framework",
 ]
 
 [[package]]
 name = "agent-switch-menubar"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "agent-switch-core",
  "block2",
