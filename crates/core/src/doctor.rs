@@ -101,9 +101,9 @@ fn keychain_checks(input: &DoctorInput) -> Vec<Check> {
     match &identity_found {
         Ok(true) => out.push(check(Level::Ok, "signing identity", format!("`{identity}` found"))),
         Ok(false) => out.push(check(
-            Level::Warn,
+            Level::Ok,
             "signing identity",
-            format!("`{identity}` not found. Create a self-signed Code Signing certificate with that name in Keychain Access, then run scripts/sign.sh"),
+            format!("`{identity}` not found (optional; only needed for the signed install)"),
         )),
         Err(e) => out.push(check(Level::Warn, "signing identity", format!("could not check: {e}"))),
     }
@@ -111,16 +111,20 @@ fn keychain_checks(input: &DoctorInput) -> Vec<Check> {
     match backend {
         "signed-helper" => out.push(check(Level::Ok, "keychain", "signed helper in use (no size limit, no prompts after rebuilds)")),
         _ => {
-            let why = match signing::helper_path_beside(exe) {
-                None => "helper binary not found beside the executable".to_string(),
-                Some(_) if identity_found.unwrap_or(false) => "helper is not signed with the identity; run scripts/sign.sh".to_string(),
-                Some(_) => "helper is not signed".to_string(),
-            };
-            out.push(check(
-                Level::Warn,
-                "keychain",
-                format!("using /usr/bin/security: logins larger than about 4 KB are refused ({why})"),
-            ));
+            let helper_present = signing::helper_path_beside(exe).is_some();
+            if helper_present && identity_found.unwrap_or(false) {
+                out.push(check(
+                    Level::Warn,
+                    "keychain",
+                    "using /usr/bin/security although the helper and the signing identity exist: the helper is not signed with the identity; run scripts/install.sh --signed",
+                ));
+            } else {
+                out.push(check(
+                    Level::Ok,
+                    "keychain",
+                    "using /usr/bin/security (no certificate needed; vault logins over about 4 KB are stored in parts)",
+                ));
+            }
         }
     }
     out

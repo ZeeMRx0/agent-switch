@@ -16,24 +16,27 @@ Each surface is bound to an account or left `unmanaged`. A switch touches only t
 
 Requirements: macOS, a Rust toolchain (`rustup`), Xcode command line tools.
 
-### One-time: create the signing certificate
+```sh
+scripts/install.sh
+```
 
-The menu bar app and the Keychain helper are signed with a stable local identity so that Keychain trust and notification permission survive rebuilds.
+This needs no certificate. It builds in release mode, copies `agent-switch` to `~/.local/bin` (make sure that folder is on `PATH`) and installs an ad-hoc signed `AgentSwitch.app` to `~/Applications`. The vault keeps logins in the Keychain through `/usr/bin/security`. A login larger than about 4 KB is split into parts, so large logins are stored in both install types. macOS may ask again for notification permission after a reinstall. `--adhoc` is accepted as an alias of the default.
+
+### Signed install (optional)
+
+```sh
+scripts/install.sh --signed
+```
+
+A signed install uses a stable local identity. Its benefits are that the vault goes through the `SecItem` helper `agent-switch-keychain` (placed beside the CLI), and that the app keeps its notification permission across reinstalls.
+
+Create the certificate once:
 
 1. Open Keychain Access, then Certificate Assistant, then Create a Certificate.
 2. Name: `agent-switch Code Signing`. Identity Type: Self Signed Root. Certificate Type: Code Signing. Create it.
 3. Check it with `security find-identity -p codesigning`. The first signing run may ask to use the private key: choose Always Allow.
 
-Create the certificate **before** you add accounts. The signed helper opens a different vault than `/usr/bin/security` does, so logins saved with one are invisible to the other. `scripts/install.sh` refuses a signed install over an existing vault unless you pass `--allow-vault-backend-change` (then add your accounts again).
-
-### Build and install
-
-```sh
-scripts/install.sh            # signed: needs the certificate
-scripts/install.sh --adhoc    # no certificate: CLI plus an ad-hoc signed app
-```
-
-This builds in release mode, copies `agent-switch` to `~/.local/bin` (make sure that folder is on `PATH`) and installs `AgentSwitch.app` to `~/Applications`. A signed install also puts `agent-switch-keychain` beside the CLI. With `--adhoc` the vault uses `/usr/bin/security`, which refuses logins larger than about 4 KB in one item (the vault splits larger ones into parts), and the app's Keychain trust and notification permission reset on every reinstall.
+The signed helper opens a different vault than `/usr/bin/security` does, so logins saved with one install type are invisible to the other. Switching between the two means adding your accounts again. `scripts/install.sh --signed` refuses to install over an existing `/usr/bin/security` vault unless you pass `--allow-vault-backend-change`, and the default install refuses when `agent-switch-keychain` is already installed beside the CLI.
 
 Open the app with `open ~/Applications/AgentSwitch.app` and answer the notification prompt. Quit it from its menu before you reinstall.
 
@@ -154,7 +157,7 @@ agent-switch default-link disable       # put the real folder back
 - **Never run `/logout`** in Claude Code or `codex logout` on a managed surface. That revokes the login that the vault also holds, and the saved copy stops working. Use `agent-switch switch` or `bind` instead.
 - **Terms of service.** Refreshing OAuth logins outside the official clients is an area that Anthropic's policy for third-party use of subscription OAuth addresses. `refresh_inactive` is off by default for that reason: by default agent-switch refreshes a saved login only just before switching to it, and never the active login (the official client owns it). Read the current terms of your plan and decide.
 - **Undocumented endpoints.** Usage comes from `api/oauth/usage` (Claude), `backend-api/wham/usage` (ChatGPT) and `v1internal:fetchAvailableModels` (Antigravity, per-model quota mapped to the two windows). If they change, `list` shows the last-known values with their age and auto mode pauses.
-- **Claude login size.** `/usr/bin/security` accepts about 4 KB. The live Claude login with many MCP logins can exceed that; switches then refuse (fail closed) until you remove unused MCP logins. The signed helper has no such limit.
+- **Claude login size.** The vault splits large logins in both install types. Claude Code's own `Claude Code-credentials` item is always written through `/usr/bin/security`, which accepts about 4 KB. The live Claude login with many MCP logins can exceed that; switches then refuse (fail closed) until you remove unused MCP logins, in both install types.
 - **Time Machine and APFS snapshots keep deleted plaintext.** Removing an old `auth.json` or backup does not remove it from earlier backups or local snapshots. Exclude `~/.agent-switch` from Time Machine (`tmutil addexclusion ~/.agent-switch`), and consider logging in to each account once after migration so the old copies are invalid.
 - **Stored secrets.** Logins live in the Keychain. Live auth files (`~/.codex/auth.json`, the shallow home's `auth.json`) are mode `0600`. No token appears in command arguments or logs; emails are masked in output.
 

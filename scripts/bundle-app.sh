@@ -4,11 +4,10 @@
 # A bundle is required: notifications with buttons (UNUserNotificationCenter) and the login item
 # (SMAppService) both refuse to work from a bare executable.
 #
-# Usage: scripts/bundle-app.sh [--adhoc] [--debug] [--install]
-#   (default)  sign with the stable identity below; fail if it is missing. See scripts/sign.sh for how to
-#              create it once. Keychain items and notification permission survive rebuilds.
-#   --adhoc    development only: sign ad hoc. An ad-hoc signature changes on every build, so Keychain
-#              access and the notification permission RESET after each rebuild.
+# Usage: scripts/bundle-app.sh [--signed] [--debug] [--install]
+#   (default)  sign ad hoc; no certificate needed. --adhoc is accepted as an alias of the default.
+#   --signed   sign with the stable identity below; fail if it is missing. See scripts/sign.sh for how to
+#              create it once. The notification permission then survives rebuilds.
 #   --debug    use the debug build (default: release)
 #   --install  copy the bundle to ~/Applications (replacing the old copy; quit the app first)
 # Override the identity name with AGENT_SWITCH_SIGN_IDENTITY.
@@ -18,12 +17,13 @@ IDENTITY="${AGENT_SWITCH_SIGN_IDENTITY:-agent-switch Code Signing}"
 BUNDLE_ID="dev.agent-switch.menubar"
 APP_NAME="AgentSwitch.app"
 
-ADHOC=0
+SIGNED=0
 PROFILE=release
 INSTALL=0
 for arg in "$@"; do
     case "$arg" in
-        --adhoc) ADHOC=1 ;;
+        --signed) SIGNED=1 ;;
+        --adhoc) SIGNED=0 ;;
         --debug) PROFILE=debug ;;
         --install) INSTALL=1 ;;
         *) echo "error: unknown option $arg" >&2; exit 2 ;;
@@ -35,10 +35,10 @@ BUILD_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 OUT_DIR="$BUILD_DIR/$PROFILE"
 APP="$BUILD_DIR/bundle/$APP_NAME"
 
-if [ "$ADHOC" -eq 0 ]; then
+if [ "$SIGNED" -eq 1 ]; then
     if ! security find-identity -p codesigning | grep -F "\"$IDENTITY\"" >/dev/null 2>&1; then
         echo "error: code-signing identity \"$IDENTITY\" not found in the keychain." >&2
-        echo "Create it once (see scripts/sign.sh), or pass --adhoc for a development-only build." >&2
+        echo "Create it once (see scripts/sign.sh), or run without --signed to build without a certificate." >&2
         exit 1
     fi
     SIGN="$IDENTITY"
@@ -84,7 +84,6 @@ fi
 
 echo "bundle: $APP"
 codesign -dvv "$APP" 2>&1 | grep -E '^(Identifier|Authority|Signature)' | sed 's/^/  /'
-if [ "$ADHOC" -eq 1 ]; then
-    echo "WARNING: signed ad hoc. The signature changes on every rebuild, so Keychain access and the" >&2
-    echo "notification permission reset each time. Use the stable identity for real use." >&2
+if [ "$SIGNED" -eq 0 ]; then
+    echo "note: built without a certificate; macOS may ask again for notification permission after a reinstall."
 fi
