@@ -25,10 +25,10 @@ pub fn status() -> LoginStatus {
         LoginStatus::Enabled
     } else if status == SMAppServiceStatus::RequiresApproval {
         LoginStatus::NeedsApproval
-    } else if status == SMAppServiceStatus::NotRegistered {
-        LoginStatus::Disabled
     } else {
-        LoginStatus::Unavailable("macOS cannot find this app; move it to Applications".into())
+        // An app that never registered reports NotFound, not NotRegistered, and `register` still works
+        // from that state. A real failure shows up as a notice when the user turns the switch on.
+        LoginStatus::Disabled
     }
 }
 
