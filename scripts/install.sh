@@ -1,7 +1,8 @@
 #!/bin/sh
+# For local testing. Users install with Homebrew (see README.md).
 # Build agent-switch in release mode and install it:
 #   - the CLI to ~/.local/bin/agent-switch (with the signed Keychain helper beside it for --signed)
-#   - the menu bar app to ~/Applications/AgentSwitch.app
+#   - the menu bar app to ~/Applications/Agent Switch.app
 #
 # Usage: scripts/install.sh [--signed] [--allow-vault-backend-change]
 #   (default)  no certificate needed. Installs the CLI alone and an ad-hoc signed app. The vault keeps

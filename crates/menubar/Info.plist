@@ -5,9 +5,9 @@
     <key>CFBundleIdentifier</key>
     <string>dev.agent-switch.menubar</string>
     <key>CFBundleName</key>
-    <string>agent-switch</string>
+    <string>Agent Switch</string>
     <key>CFBundleDisplayName</key>
-    <string>agent-switch</string>
+    <string>Agent Switch</string>
     <key>CFBundleExecutable</key>
     <string>agent-switch-menubar</string>
     <key>CFBundleIconFile</key>

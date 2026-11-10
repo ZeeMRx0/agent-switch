@@ -5,7 +5,7 @@
 //! provider's fixed subcommand. The one value the user types (the Antigravity account id) is read by the
 //! script itself and passed quoted, so it never becomes part of the script text.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use agent_switch_core::config::Provider;
@@ -41,19 +41,38 @@ fn provider_lines(provider: Provider) -> &'static str {
     }
 }
 
-/// The text of the script for `provider`. It uses the CLI that `install.sh` put in `~/.local/bin`, else the
-/// one on the login shell's `PATH`, and waits for Enter at the end so the output can be read.
-pub fn script(provider: Provider) -> String {
+/// The CLI inside the running app bundle (`Contents/MacOS/agent-switch`), when it is there.
+fn bundled_cli() -> Option<PathBuf> {
+    let cli = std::env::current_exe().ok()?.parent()?.join("agent-switch");
+    cli.is_file().then_some(cli)
+}
+
+/// `text` as one single-quoted shell word.
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// The text of the script for `provider`. It uses the CLI beside the app executable (`bundled`), else the one
+/// that `install.sh` put in `~/.local/bin`, else the one on the login shell's `PATH`, and waits for Enter at
+/// the end so the output can be read.
+fn script_with(provider: Provider, bundled: Option<&Path>) -> String {
+    let bundled = bundled.map(|p| shell_quote(&p.to_string_lossy())).unwrap_or_else(|| "''".to_string());
     format!(
         "#!/bin/zsh -l\n\
-         bin=\"$HOME/{INSTALLED_CLI}\"\n\
+         bin={bundled}\n\
+         [ -x \"$bin\" ] || bin=\"$HOME/{INSTALLED_CLI}\"\n\
          [ -x \"$bin\" ] || bin=\"$(command -v agent-switch)\"\n\
-         if [ -z \"$bin\" ]; then\n  echo \"agent-switch was not found. Run scripts/install.sh from the project folder, then try again.\"\nelse\n{body}fi\n\
+         if [ -z \"$bin\" ]; then\n  echo \"agent-switch was not found. Install agent-switch with Homebrew: brew install zeemrx0/tap/agent-switch\"\nelse\n{body}fi\n\
          echo\n\
          echo \"Done. You can close this window.\"\n\
          read -r reply\n",
         body = provider_lines(provider)
     )
+}
+
+/// The script of `provider` for this running app.
+pub fn script(provider: Provider) -> String {
+    script_with(provider, bundled_cli().as_deref())
 }
 
 /// Write the script of `provider` into the app's private `tmp` folder, executable by the user only.
@@ -94,6 +113,13 @@ mod tests {
     }
 
     #[test]
+    fn the_cli_beside_the_app_comes_first_and_is_quoted() {
+        let s = script_with(Provider::Claude, Some(Path::new("/Apps/Agent Switch.app/it's/agent-switch")));
+        assert!(s.contains("bin='/Apps/Agent Switch.app/it'\\''s/agent-switch'\n[ -x \"$bin\" ] || bin=\"$HOME/"), "{s}");
+        assert!(script_with(Provider::Claude, None).contains("bin=''\n"));
+    }
+
+    #[test]
     fn the_antigravity_id_is_read_by_the_script_and_passed_quoted() {
         let s = script(Provider::Antigravity);
         assert!(s.contains("sign in") || s.contains("Sign in with agy first"), "{s}");
@@ -109,7 +135,7 @@ mod tests {
             assert!(s.starts_with("#!/bin/zsh -l\n"), "{s}");
             assert!(s.contains("bin=\"$HOME/.local/bin/agent-switch\""), "{s}");
             assert!(s.contains("command -v agent-switch"), "{s}");
-            assert!(s.contains("scripts/install.sh"), "{s}");
+            assert!(s.contains("brew install zeemrx0/tap/agent-switch") && !s.contains("scripts/install.sh"), "{s}");
             assert!(s.contains("Done. You can close this window."), "{s}");
             assert!(s.trim_end().ends_with("read -r reply"), "{s}");
         }

@@ -14,15 +14,46 @@ Each surface is bound to an account or left `unmanaged`. A switch touches only t
 
 ## Install
 
-Requirements: macOS, a Rust toolchain (`rustup`), Xcode command line tools.
+```sh
+brew install zeemrx0/tap/agent-switch
+```
+
+This one command builds agent-switch from source on your Mac. It needs Rust, which Homebrew installs for you, and takes a few minutes. It then:
+
+- puts a signed `Agent Switch.app` in `~/Applications` (signed ad hoc, so no certificate is needed);
+- links the `agent-switch` command onto your `PATH` from inside that app;
+- opens the app.
+
+Upgrade with `brew upgrade`. This rebuilds, quits the running app and opens it again. Remove the app and the command with `brew uninstall --cask agent-switch`. Your saved accounts in the Keychain vault and the app data stay on the Mac.
+
+The vault keeps logins in the Keychain through `/usr/bin/security`. A login larger than about 4 KB is split into parts. Each build has a new ad-hoc signature, so macOS may ask again for notification or Keychain permission after an upgrade.
+
+### Coming from a script install
+
+The Homebrew install removes `~/Applications/AgentSwitch.app` and `~/.local/bin/agent-switch` for you, after the new build succeeds. If the old app is running, the install stops and asks you to quit it from its menu. Run the command again after that. Your saved accounts stay in the vault.
+
+If you installed with `scripts/install.sh --signed`, the install stops with a message. A signed install keeps its logins in a different vault. Remove `~/.local/bin/agent-switch` and `~/.local/bin/agent-switch-keychain` after you save your accounts, then run the command again. You add your accounts again afterwards.
+
+### Coming from the Homebrew formula
+
+An earlier release came as a Homebrew formula. Remove it first, then install the cask:
+
+```sh
+brew uninstall --formula agent-switch
+brew install zeemrx0/tap/agent-switch
+```
+
+### Local testing
+
+To build and install from a checkout without Homebrew:
 
 ```sh
 scripts/install.sh
 ```
 
-This needs no certificate. It builds in release mode, copies `agent-switch` to `~/.local/bin` (make sure that folder is on `PATH`) and installs an ad-hoc signed `AgentSwitch.app` to `~/Applications`. The vault keeps logins in the Keychain through `/usr/bin/security`. A login larger than about 4 KB is split into parts, so large logins are stored in both install types. macOS may ask again for notification permission after a reinstall. `--adhoc` is accepted as an alias of the default.
+This needs no certificate. It needs a Rust toolchain (`rustup`) and the Xcode command line tools. A local install refuses while the Homebrew cask is installed. It builds in release mode, copies `agent-switch` to `~/.local/bin` (make sure that folder is on `PATH`) and installs an ad-hoc signed `Agent Switch.app` to `~/Applications`. It also removes a legacy `AgentSwitch.app`. `--adhoc` is accepted as an alias of the default.
 
-### Signed install (optional)
+#### Signed install (optional)
 
 ```sh
 scripts/install.sh --signed
@@ -38,7 +69,7 @@ Create the certificate once:
 
 The signed helper opens a different vault than `/usr/bin/security` does, so logins saved with one install type are invisible to the other. Switching between the two means adding your accounts again. `scripts/install.sh --signed` refuses to install over an existing `/usr/bin/security` vault unless you pass `--allow-vault-backend-change`, and the default install refuses when `agent-switch-keychain` is already installed beside the CLI.
 
-Open the app with `open ~/Applications/AgentSwitch.app` and answer the notification prompt. Quit it from its menu before you reinstall.
+Open the app with `open "$HOME/Applications/Agent Switch.app"` and answer the notification prompt. Quit it from its menu before you reinstall.
 
 ### Shell setup
 
