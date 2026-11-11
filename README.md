@@ -14,23 +14,39 @@ Each surface is bound to an account or left `unmanaged`. A switch touches only t
 
 ## Install
 
+Two ways. Both install a prebuilt, ad-hoc signed `Agent Switch.app` for Apple silicon Macs on macOS 13 or later. Neither needs Rust.
+
+### Homebrew
+
 ```sh
 brew install zeemrx0/tap/agent-switch
 ```
 
-This one command builds agent-switch from source on your Mac. It needs Rust, which Homebrew installs for you, and takes a few minutes. It then:
+This downloads the prebuilt app, so it is fast and needs no Rust. It shows no "unidentified developer" prompt, because the cask clears the download quarantine flag. It then:
 
-- puts a signed `Agent Switch.app` in `~/Applications` (signed ad hoc, so no certificate is needed);
+- puts `Agent Switch.app` in `~/Applications`;
 - links the `agent-switch` command onto your `PATH` from inside that app;
 - opens the app.
 
-Upgrade with `brew upgrade`. This rebuilds, quits the running app and opens it again. Remove the app and the command with `brew uninstall --cask agent-switch`. Your saved accounts in the Keychain vault and the app data stay on the Mac.
+Upgrade with `brew upgrade`. This quits the running app and opens the new one. Remove the app and the command with `brew uninstall --cask agent-switch`. Your saved accounts in the Keychain vault and the app data stay on the Mac.
 
-The vault keeps logins in the Keychain through `/usr/bin/security`. A login larger than about 4 KB is split into parts. Each build has a new ad-hoc signature, so macOS may ask again for notification or Keychain permission after an upgrade.
+### Manual download
+
+1. Download `Agent-Switch-<version>-arm64.dmg` (or the `.zip`) from the [releases page](https://github.com/ZeeMRx0/agent-switch/releases).
+2. Drag `Agent Switch.app` to `/Applications` or `~/Applications`.
+3. Open it. macOS blocks the first launch because the app has no Apple certificate. Open **System Settings > Privacy & Security**, find the message about "Agent Switch" and click **Open Anyway**. You do this once.
+4. To use the `agent-switch` command, link it from inside the app into `~/.local/bin`. Use `~/Applications` instead of `/Applications` if you put the app there. Add `~/.local/bin` to your `PATH` if it is not there yet.
+
+```sh
+mkdir -p ~/.local/bin
+ln -sf "/Applications/Agent Switch.app/Contents/MacOS/agent-switch" ~/.local/bin/agent-switch
+```
+
+The vault keeps logins in the Keychain through `/usr/bin/security`. A login larger than about 4 KB is split into parts. Each release has a new ad-hoc signature, so macOS may ask again for notification or Keychain permission after an upgrade.
 
 ### Coming from a script install
 
-The Homebrew install removes `~/Applications/AgentSwitch.app` and `~/.local/bin/agent-switch` for you, after the new build succeeds. If the old app is running, the install stops and asks you to quit it from its menu. Run the command again after that. Your saved accounts stay in the vault.
+The Homebrew install removes `~/Applications/AgentSwitch.app` and `~/.local/bin/agent-switch` for you. If the old app is running, the install stops and asks you to quit it from its menu. Run the command again after that. Your saved accounts stay in the vault.
 
 ### Coming from the Homebrew formula
 
@@ -41,7 +57,7 @@ brew uninstall --formula agent-switch
 brew install zeemrx0/tap/agent-switch
 ```
 
-### Local testing
+### Build from a checkout
 
 To build and install from a checkout without Homebrew:
 
@@ -173,6 +189,10 @@ agent-switch default-link disable       # put the real folder back
 - **Claude login size.** The vault splits large logins into parts. Claude Code's own `Claude Code-credentials` item is always written through `/usr/bin/security`, which accepts about 4 KB. The live Claude login with many MCP logins can exceed that; switches then refuse (fail closed) until you remove unused MCP logins.
 - **Time Machine and APFS snapshots keep deleted plaintext.** Removing an old `auth.json` or backup does not remove it from earlier backups or local snapshots. Exclude `~/.agent-switch` from Time Machine (`tmutil addexclusion ~/.agent-switch`), and consider logging in to each account once after migration so the old copies are invalid.
 - **Stored secrets.** Logins live in the Keychain. Live auth files (`~/.codex/auth.json`, the shallow home's `auth.json`) are mode `0600`. No token appears in command arguments or logs; emails are masked in output.
+
+## Release
+
+A maintainer pushes a stable tag `v<version>` that matches the version in `Cargo.toml`. The `Release` workflow tests, builds the ZIP and DMG, publishes the GitHub release and updates `Casks/agent-switch.rb` in `ZeeMRx0/homebrew-tap` from `packaging/homebrew/agent-switch.rb`. The repository needs a `HOMEBREW_TAP_TOKEN` secret: a fine-grained token with Contents read/write on `ZeeMRx0/homebrew-tap`.
 
 ## Migrating a hand-made setup
 

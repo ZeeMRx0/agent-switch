@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - '!v*-*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Check the tag matches the workspace version
+        id: version
+        run: |
+          version="$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p;}' Cargo.toml | head -n 1)"
+          if [ -z "$version" ] || [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match the Cargo.toml version (${version:-unknown})."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust stable
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build and package
+        run: scripts/ci/package-release.sh "${{ steps.version.outputs.version }}" dist
+
+      - name: Publish the GitHub release
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cat > notes.md <<EOF
+          ## Install
+
+          **Homebrew** (prebuilt app, Apple silicon, no security prompt):
+
+          \`\`\`sh
+          brew install zeemrx0/tap/agent-switch
+          \`\`\`
+
+          **Manual download** (Apple silicon): download \`Agent-Switch-$VERSION-arm64.dmg\` or the \`.zip\` below and drag \`Agent Switch.app\` to \`/Applications\` or \`~/Applications\`.
+          The app is signed ad hoc, so on first launch macOS blocks it. Open **System Settings > Privacy & Security**, scroll to the message about "Agent Switch" and click **Open Anyway**.
+          The \`agent-switch\` command sits inside the app. Link it into \`~/.local/bin\` (use \`~/Applications\` instead of \`/Applications\` if you put the app there) and add that folder to your PATH if needed:
+
+          \`\`\`sh
+          mkdir -p ~/.local/bin
+          ln -sf "/Applications/Agent Switch.app/Contents/MacOS/agent-switch" ~/.local/bin/agent-switch
+          \`\`\`
+          EOF
+          gh release create "v$VERSION" --verify-tag --title "v$VERSION" --notes-file notes.md \
+            "dist/Agent-Switch-$VERSION-arm64.zip" "dist/Agent-Switch-$VERSION-arm64.dmg"
+
+      - name: Update the Homebrew cask
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: scripts/ci/bump-homebrew-cask.sh "$VERSION" "dist/Agent-Switch-$VERSION-arm64.zip"
