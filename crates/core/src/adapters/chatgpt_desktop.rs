@@ -1,5 +1,6 @@
-//! The ChatGPT desktop app (`com.openai.codex`). It runs its bundled `codex app-server`, which always uses
-//! `~/.codex` (a Dock launch cannot carry environment variables), so switching the app means replacing
+//! The ChatGPT desktop app (`com.openai.codex`). It runs its bundled `codex app-server`, which uses
+//! `~/.codex`. The app reads the login-shell environment, so `shell-init` skips shells without a terminal
+//! to keep the app on `~/.codex`. Switching the app means replacing
 //! `~/.codex/auth.json` while nothing uses it, then reopening the app.
 //!
 //! Order (the app-server rewrites `auth.json` when it refreshes, so a write made before it exits could be

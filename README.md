@@ -77,7 +77,7 @@ Add to `~/.zshrc` so a new terminal points the Codex CLI at its own login:
 eval "$(agent-switch shell-init)"
 ```
 
-It prints nothing when the Codex CLI shares `~/.codex`. Shells that are already open keep their old environment.
+It prints nothing when the Codex CLI shares `~/.codex`. The export applies only to terminal shells, so the ChatGPT app, which reads your shell environment, keeps `~/.codex`. Shells that are already open keep their old environment.
 
 ## Use
 

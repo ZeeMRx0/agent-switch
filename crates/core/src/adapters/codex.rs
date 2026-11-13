@@ -366,8 +366,8 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// What `eval "$(agent-switch shell-init)"` runs: the `CODEX_HOME` export when the CLI has its own account,
-/// and nothing otherwise.
+/// What `eval "$(agent-switch shell-init)"` runs: the `CODEX_HOME` export when the CLI has its own account
+/// (only in shells with a terminal), and nothing otherwise.
 pub fn shell_init(paths: &Paths, config: &Config) -> String {
     if !cli_separate(paths, config) {
         return String::new();
@@ -375,7 +375,8 @@ pub fn shell_init(paths: &Paths, config: &Config) -> String {
     format!(
         "# agent-switch: the Codex CLI uses its own login; history stays linked to ~/.codex.\n\
          # Shells that are already open keep their old environment: open a new shell or run this again.\n\
-         export CODEX_HOME={}\n",
+         # Shells without a terminal (such as the ChatGPT app reading your environment) are skipped, so the app keeps ~/.codex.\n\
+         if [ -t 0 ]; then export CODEX_HOME={}; fi\n",
         sh_quote(&shallow_dir(paths).display().to_string())
     )
 }
@@ -775,7 +776,8 @@ pub mod tests {
         cfg.bind(crate::config::SurfaceKind::ChatgptDesktop, crate::config::Binding::parse("team")).unwrap();
         cfg.bind(crate::config::SurfaceKind::CodexCli, crate::config::Binding::parse("personal")).unwrap();
         let out = shell_init(&f.paths, &cfg);
-        assert!(out.contains("export CODEX_HOME='") && out.contains(".agent-switch/codex-cli'"), "{out}");
+        assert!(out.contains("if [ -t 0 ]; then export CODEX_HOME='") && out.contains(".agent-switch/codex-cli'; fi"), "{out}");
+        assert!(out.contains("skipped, so the app keeps ~/.codex"));
         assert!(out.contains("already open keep their old environment"));
 
         cfg.bind(crate::config::SurfaceKind::CodexCli, crate::config::Binding::parse("team")).unwrap();
