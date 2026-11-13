@@ -448,7 +448,7 @@ fn footer(config: &Config, ctx: &Ctx) -> Vec<Entry> {
         Entry::Separator,
         login_entry(&ctx.login),
     ];
-    vec![Entry::Submenu { text: "Settings".into(), entries: settings }, Entry::item("Quit agent-switch", Action::Quit)]
+    vec![Entry::Submenu { text: "Settings".into(), entries: settings }, Entry::item("Quit", Action::Quit)]
 }
 
 /// The whole menu.
@@ -504,7 +504,7 @@ pub fn error_menu(message: &str, ctx: &Ctx) -> Vec<Entry> {
         Entry::Label(clean(message)),
         Entry::Separator,
         login_entry(&ctx.login),
-        Entry::item("Quit agent-switch", Action::Quit),
+        Entry::item("Quit", Action::Quit),
     ]
 }
 
@@ -1019,7 +1019,7 @@ Claude >
         assert!(text.contains("[x] Notify only"), "{text}");
         assert!(text.contains("[ ] New sessions only") && text.contains("[ ] Force"), "{text}");
         assert!(text.contains("[x] Start at login"), "{text}");
-        assert!(text.contains("Quit agent-switch"), "{text}");
+        assert!(text.lines().any(|l| l.trim() == "Quit"), "{text}");
 
         let actions: Vec<Action> = flatten(&menu).into_iter().filter_map(|e| if let Entry::Item { action, .. } = e { action.clone() } else { None }).collect();
         assert!(actions.contains(&Action::SetCodexMode(CodexCliMode::Force)));
